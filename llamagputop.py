@@ -819,6 +819,28 @@ def llama_spec_from_cmdline(port=None):
     return None, None, None
 
 
+def llama_devices_from_cmdline(port=None):
+    """The GPU backend devices a server was told to run on (-dev / --device), e.g.
+    ['Vulkan0', 'Vulkan1']. An empty list means the flag was absent — which in llama.cpp
+    means 'use every available device'. Read at runtime from the process, named after
+    nothing: it just returns whatever labels the command line carries. Used to charge a
+    server's energy line to the cards IT actually uses, not the whole box."""
+    for p in glob.glob("/proc/[0-9]*"):
+        if (read(f"{p}/comm", "") or "") != "llama-server":
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if port is not None and _port_of(cmd) != str(port):
+            continue
+        for flag in ("-dev", "--device"):
+            if flag in cmd:
+                try:
+                    return [x for x in cmd[cmd.index(flag) + 1].split(",") if x and x != "none"]
+                except IndexError:
+                    return []
+        return []
+    return []
+
+
 def llama_settings_from_cmdline(port=None):
     """The active server configuration, read from its command line and organized by
     theme — not the raw argv, but the settings that actually shape a run: what was
@@ -850,6 +872,11 @@ def llama_settings_from_cmdline(port=None):
             return d
 
         base = lambda v: os.path.basename(v).replace(".gguf", "") if isinstance(v, str) else None
+        # draft KV cache type (-ctkd/-ctvd): shown, like the main cache, only when the run
+        # set it — a draft at higher KV precision drafts a touch better, at more memory.
+        _dkv_k = g("-ctkd", "--cache-type-k-draft", "--spec-draft-type-k")
+        _dkv_v = g("-ctvd", "--cache-type-v-draft", "--spec-draft-type-v")
+        draft_kv = f"{_dkv_k or 'f16'}/{_dkv_v or 'f16'}" if (_dkv_k or _dkv_v) else None
         return {
             "loading": [
                 ("model", base(g("-m", "--model"))),
@@ -880,7 +907,16 @@ def llama_settings_from_cmdline(port=None):
                 ("type", g("--spec-type")),
                 ("head", base(g("-md", "--model-draft", "--spec-draft-model"))),
                 ("n-max", g("--spec-draft-n-max")),
+                ("n-min", g("--spec-draft-n-min")),
+                # p-min is the adaptive cut-off: the draft stops proposing once its own
+                # confidence drops below it (default 0.00 = never cut). One of the biggest,
+                # most-tuned knobs — it reshapes the acceptance curve — and was missing here.
+                ("p-min", g("--spec-draft-p-min", "--draft-p-min")),
+                ("p-split", g("--spec-draft-p-split", "--draft-p-split")),
                 ("draft-dev", g("-devd", "--device-draft")),
+                ("draft-kv", draft_kv),
+                ("draft-ngl", g("-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft")),
+                ("draft-ctx", g("-cd", "--ctx-size-draft")),
             ],
         }
     return None
@@ -946,7 +982,7 @@ def llama_processes():
             continue
         for f in files:
             t = read(f"{p}/fdinfo/{f}", "") or ""
-            if "drm-memory-vram" not in t:
+            if "drm-memory-vram" not in t and "drm-memory-local" not in t:
                 continue
             for r in t.splitlines():
                 if ":" not in r:
@@ -956,9 +992,10 @@ def llama_processes():
                 if not m:
                     continue
                 kb = int(m.group(1))
-                if k.strip() == "drm-memory-vram":
+                k_strip = k.strip()
+                if k_strip in ("drm-memory-vram", "drm-memory-local"):
                     v["vram"] = kb // 1024
-                elif k.strip() == "drm-memory-gtt":
+                elif k_strip in ("drm-memory-gtt", "drm-memory-system"):
                     v["gtt"] = kb // 1024
             v["read"] = True
             break
@@ -981,6 +1018,7 @@ class LlamaProbe:
         self._dlast = 0
         self.model = ""
         self.model_at = 0.0
+        self._rf = None                    # reasoning format (from /slots, survives ticks)
 
     def _get(self, path, timeout=1.2):
         import urllib.request
@@ -997,15 +1035,22 @@ class LlamaProbe:
              "max_tok": 0, "reuse": None, "budget": 0, "decoded": 0}
         try:
             m = {}
-            for line in self._get("/metrics").splitlines():
-                if line.startswith("#") or " " not in line:
-                    continue
-                k, _, v = line.partition(" ")
-                try:
-                    m[k] = float(v)
-                except ValueError:
-                    pass
-            d["alive"] = True
+            raw = self._get("/metrics")
+            # Old / unconfigured builds return a JSON error body on /metrics;
+            # treat it as "no counters" but mark the server alive so the /slots
+            # block below still runs.
+            if raw.lstrip().startswith("{"):
+                d["alive"] = True
+            else:
+                for line in raw.splitlines():
+                    if line.startswith("#") or " " not in line:
+                        continue
+                    k, _, v = line.partition(" ")
+                    try:
+                        m[k] = float(v)
+                    except ValueError:
+                        pass
+                d["alive"] = True
             d["active"] = int(m.get("llamacpp:requests_processing", 0))
             d["queued"] = int(m.get("llamacpp:requests_deferred", 0))
             # prompt-cache reuse (how well --cache-reuse pays off) and the largest
@@ -1046,7 +1091,10 @@ class LlamaProbe:
         try:
             s = json.loads(self._get("/slots"))
             x = s[0] if isinstance(s, list) and s else {}
-            busy = bool(x.get("is_processing"))
+            # New builds have is_processing (bool); old builds instead have
+            # state (int): 0=idle, 1=started/prefill, 2=prompt_done, 3=gen
+            st = x.get("state")
+            busy = bool(x.get("is_processing")) or (st is not None and st != 0)
             nt = x.get("next_token")
             nt = nt[0] if isinstance(nt, list) and nt else nt if isinstance(nt, dict) else {}
             dec = nt.get("n_decoded", 0) or 0
@@ -1070,12 +1118,19 @@ class LlamaProbe:
                 t0, d0 = self._dhist[0]
                 if len(self._dhist) >= 2 and now - t0 >= 0.8 and dec - d0 > 0:
                     self.tg = (dec - d0) / (now - t0)
-            d["phase"] = "generating" if (busy and dec > 0) else "prefill" if busy else "idle"
+            if st is not None:
+                # Old-format slot with explicit state enum — more precise
+                d["phase"] = {1: "prefill", 2: "prefill", 3: "generating"}.get(st, "idle")
+            else:
+                d["phase"] = "generating" if (busy and dec > 0) else "prefill" if busy else "idle"
             nctx = x.get("n_ctx", 0) or 0
             d["ctx"] = nctx
-            occupied = max(x.get("n_prompt_tokens", 0) or 0,
-                           (x.get("n_prompt_tokens_cache", 0) or 0)
-                           + (x.get("n_prompt_tokens_processed", 0) or 0)) + dec
+            # New builds have n_prompt_tokens*; old builds don't — fall back to
+            # the decoded count alone (incomplete but honest)
+            _npt = x.get("n_prompt_tokens", 0) or 0
+            _npc = (x.get("n_prompt_tokens_cache", 0) or 0) \
+                 + (x.get("n_prompt_tokens_processed", 0) or 0)
+            occupied = (max(_npt, _npc) + dec) if (_npt or _npc) else dec
             if nctx:
                 d["kv"] = min(1.0, occupied / nctx)
             d["alive"] = True
@@ -1083,6 +1138,15 @@ class LlamaProbe:
         except Exception:
             pass
         d["pp"], d["tg"] = self.pp, self.tg
+        # reasoning format is in the slot data itself (both old and new builds)
+        try:
+            _rf = (x.get("params", {}) or {}).get("reasoning_format") \
+                  or x.get("reasoning_format")
+        except Exception:
+            _rf = None
+        if _rf:
+            self._rf = _rf
+        d["reasoning_format"] = self._rf
         if d["alive"] and (not self.model or time.monotonic() - self.model_at > 15):
             self.model_at = time.monotonic()
             try:
@@ -1480,6 +1544,25 @@ def _fmt_dur(seconds):
     return f"{s}s"
 
 
+def system_power(gpus_data, cpu):
+    """Total watts the machine draws right now, summed from every meter it actually exposes —
+    one term per GPU the tool discovered, plus the CPU package via RAPL. Nothing about the
+    hardware is named or assumed: it adds whatever discover_gpus() returned, so the same code
+    is right on a one-GPU laptop and on a four-GPU server, and picks up a new card for free.
+    Returns (watts, missing): `missing` names any component that HAS a meter the tool could
+    not read (the CPU when RAPL is root-only and not yet opened), so a figure covering only
+    part of the box is never passed off as the whole-system draw."""
+    total, missing = 0.0, []
+    for s in gpus_data:
+        if s.get("power") is not None:
+            total += s["power"]
+    if cpu.get("power") is not None:
+        total += cpu["power"]
+    elif cpu.get("rapl_present"):
+        missing.append("CPU (needs root)")
+    return total, missing
+
+
 def _power_rows(gpus_data, cpu, llamas, width):
     """Electrical overview laid out horizontally: each readable watt meter as a compact
     cell (the point is the whole picture, not one reading), then a prominent TOTAL with
@@ -1487,13 +1570,12 @@ def _power_rows(gpus_data, cpu, llamas, width):
     efficiency: how many tokens per second we get for each kilowatt drawn (t/s per kW,
     which is the same number as tokens per kJ)."""
     inner = width - 4
-    parts, total = [], 0.0
+    total, missing = system_power(gpus_data, cpu)
+    parts = []
     for s in gpus_data:
         if s.get("power") is not None:
-            total += s["power"]
             parts.append((s["vendor"], s["power"], s.get("power_cap")))
     if cpu.get("power") is not None:
-        total += cpu["power"]
         parts.append(("CPU", cpu["power"], None))
     if not parts:
         return [[("no readable power sensors (GPU hwmon / CPU RAPL, the latter often "
@@ -1524,8 +1606,14 @@ def _power_rows(gpus_data, cpu, llamas, width):
         eff = sum_tg / (total / 1000.0)                # t/s per kW  ==  tokens/kJ
         if line:
             line.append(("      ", 0))
-        line += [("efficiency ", DIM), (f"{eff:.0f} t/s per kW", OK),
-                 (f"  ({sum_tg:.1f} t/s / {total:.0f} W)", DIM)]
+        # whole-system efficiency: EVERY server's tokens over the TOTAL system draw — as
+        # opposed to the per-session tok/kJ shown in the llama panel. If a component's meter
+        # could not be read the total is short by it, so say so instead of overstating.
+        line += [("system efficiency ", DIM), (f"{eff:.0f} t/s per kW", OK),
+                 (f"  ({sum_tg:.1f} t/s / {total:.0f} W total", DIM)]
+        if missing:
+            line.append((" · excludes " + ", ".join(missing), WARN))
+        line.append((")", DIM))
     if line:
         rows.append(line)
     return rows
@@ -1764,6 +1852,10 @@ def _llama_rows(d, width):
     elif d.get("reuse") is not None:
         ri = d["reuse"]
         rows.append([("prompt   ", DIM), ("reused ", DIM), (f"{ri * 100:.1f}%", OK if ri > 0.3 else 0)])
+    # reasoning format detected at runtime from the slot data, not the cmdline
+    rf = d.get("reasoning_format")
+    if rf and rf not in ("none", ""):
+        rows.append([("reasoning ", DIM), (rf, OK)])
     # speculative head + how well it drafts, on one line; per-position beneath
     spec = []
     if d.get("spec_type") not in (None, "", "none") or d.get("spec_head"):
@@ -1790,9 +1882,9 @@ def _llama_rows(d, width):
     w = d.get("power_w") or 0
     if d.get("phase") == "generating" and d.get("tg", 0) > 0 and w > 0:
         rows.append([(f"{'energy':<{ET}}", DIM),
-                     (f"{d['tg']:.1f} t/s at {w:.0f} W = ", DIM),
+                     (f"{d['tg']:.1f} t/s at {w:.0f} W on its GPUs = ", DIM),
                      (f"{d['tg'] / w * 1000:.0f} tok/kJ", OK),
-                     ("   higher is more efficient", DIM)])
+                     ("   this session (system draw is in power)", DIM)])
     return rows
 
 
@@ -1909,7 +2001,7 @@ def _collect(gpus, explicit_port=None):
     mem = mem_sample()
     llamas = sample_llama_fleet(explicit_port)
     # hardware trend series — always live, so the trend panel is never blank
-    total_w = sum((s.get("power") or 0) for s in gpus_data) + (cpu.get("power") or 0)
+    total_w, _ = system_power(gpus_data, cpu)      # single source of truth for the whole-box draw
     record("power_series", total_w)
     record("ram_series", mem["free"])
     record("cpu_util", cpu.get("util") or 0)
@@ -1925,7 +2017,15 @@ def _collect(gpus, explicit_port=None):
     cfgs = {}
     for d in llamas:
         port = d["port"]
-        d["power_w"] = total_w
+        # charge THIS server's energy line to the power of the GPUs it runs on (its -dev
+        # list; all cards when -dev is absent) — not the whole-box draw, which is the power
+        # panel's job. So the per-session figure and the system figure are genuinely different
+        # numbers: the session one omits the CPU and any card this server does not use.
+        _devs = llama_devices_from_cmdline(port)
+        _gp = [s for s in gpus_data if (not _devs) or (s.get("backend_dev") in _devs)]
+        if _devs and not _gp:                 # -dev set but unmappable (no vulkaninfo) → all cards
+            _gp = gpus_data
+        d["power_w"] = sum((s.get("power") or 0) for s in _gp)
         cfgs[port] = llama_settings_from_cmdline(port) if d.get("alive") else None
         # each server's speed histories are tied to its model: reset on a swap
         model = d.get("model") or ""
@@ -2039,13 +2139,11 @@ def _tui(w, gpus, feeds, port):
 
 def _text_line(gpus_data, cpu, mem, llamas, cfgs=None, procs=None):
     parts = []
-    total_w = 0.0
+    total_w, _ = system_power(gpus_data, cpu)
     for s in gpus_data:
         vram = f"{s.get('vram_used') or 0}/{s.get('vram_total') or 0}" if s.get("vram_total") else "-"
-        total_w += s.get("power") or 0
         parts.append(f"{s['vendor']} util {s.get('util') or 0:.0f}% vram {vram} "
                      f"{s.get('temp_main') or '-'}C {s.get('power') or 0:.0f}W")
-    total_w += cpu.get("power") or 0
     parts.append(f"CPU {cpu.get('util') or 0:.0f}% {cpu.get('temp') or '-'}C "
                  f"{('%.0fW' % cpu['power']) if cpu.get('power') is not None else '-'}")
     parts.append(f"RAM {mem['free']}/{mem['total']}")
