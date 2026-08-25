@@ -1047,7 +1047,7 @@ class LlamaProbe:
              "spec_acc": 0, "spec_draft": 0, "spec_pos": [], "active": 0, "queued": 0,
              "pp_life": 0.0, "tg_life": 0.0, "spec_type": None, "spec_head": None,
              "spec_nmax": None, "spec_stale": False, "cache_hit": 0, "prompt_new": 0,
-             "max_tok": 0, "reuse": None, "budget": 0, "decoded": 0}
+             "max_tok": 0, "reuse": None, "budget": 0, "decoded": 0, "kv_used": 0}
         try:
             m = {}
             raw = self._get("/metrics")
@@ -1150,6 +1150,7 @@ class LlamaProbe:
             _npc = (x.get("n_prompt_tokens_cache", 0) or 0) \
                  + (x.get("n_prompt_tokens_processed", 0) or 0)
             occupied = (max(_npt, _npc) + dec) if (_npt or _npc) else dec
+            d["kv_used"] = occupied
             if nctx:
                 d["kv"] = min(1.0, occupied / nctx)
             d["alive"] = True
@@ -1862,7 +1863,7 @@ def _llama_rows(d, width):
         c = CRIT if kv >= 0.95 else WARN if kv >= 0.85 else OK
         bw = max(8, min(16, inner // 6))
         kv_cells = [[("kv ", DIM)] + _bar(kv, 1.0, bw, c)
-                    + [(f" {kv * 100:.1f}% of {d.get('ctx', 0)} tok", 0)]]
+                    + [(f" {kv * 100:.1f}%  {d.get('kv_used', 0)}/{d.get('ctx', 0)} tok", 0)]]
         ctx, seen = d.get("ctx", 0), d.get("max_tok", 0)
         if ctx and seen:
             q = seen / ctx
