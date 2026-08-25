@@ -1,6 +1,7 @@
 llamagputop
 
 This is a terminal monitor for Linux that tracks your GPUs and llama.cpp inference in a single Python file. It doesn't need any external dependencies beyond the standard library.
+In order to work correctly and completely --metrics must be activated on your llama.cpp servers, chmod 755 and sudo will help with all the remaining metrics. Everything can work anyway (but with less data). 
 
 ```text
  llamagputop · 2 GPUs · llama: 5 servers       VRAM 14.8G free      RAM 16.2G free       142 W       14.2 t/s 
