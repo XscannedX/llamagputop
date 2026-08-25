@@ -780,8 +780,9 @@ def discover_llama_servers():
                 model = os.path.basename(cmd[cmd.index("-m") + 1]).replace(".gguf", "")
             except IndexError:
                 pass
+        flavor = "ikllama" if cmd and "ikcpu" in cmd[0] else "llama.cpp"
         out.append({"pid": os.path.basename(p), "port": port,
-                    "host": _host_of(cmd), "model_hint": model})
+                    "host": _host_of(cmd), "model_hint": model, "flavor": flavor})
     return sorted(out, key=lambda s: s["port"])
 
 
@@ -1022,11 +1023,24 @@ class LlamaProbe:
 
     def _get(self, path, timeout=1.2):
         import urllib.request
-        with urllib.request.urlopen(f"http://{self.host}:{self.port}{path}", timeout=timeout) as r:
-            return r.read().decode()
+        import urllib.error
+        try:
+            with urllib.request.urlopen(f"http://{self.host}:{self.port}{path}", timeout=timeout) as r:
+                return r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.read().decode()
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, 'reason', None), TimeoutError):
+                raise TimeoutError()
+            raise
 
     def sample(self):
-        import json
+        import json, time
+        now = time.monotonic()
+        timeout_until = getattr(self, '_timeout_until', 0)
+        if now < timeout_until:
+            self.state["phase"] = f"timeout {int(timeout_until - now)}s"
+            return self.state
         d = {"alive": False, "phase": "off", "pp": 0.0, "tg": 0.0, "kv": None,
              "ctx": 0, "model": self.model, "spec": None, "tok_step": None,
              "spec_acc": 0, "spec_draft": 0, "spec_pos": [], "active": 0, "queued": 0,
@@ -1086,6 +1100,10 @@ class LlamaProbe:
             self.cnt = c
             d["pp_life"] = c[C[0]] / c[C[1]] if c[C[1]] else 0.0
             d["tg_life"] = c[C[2]] / c[C[3]] if c[C[3]] else 0.0
+        except TimeoutError:
+            self._timeout_until = time.monotonic() + 60
+            self.state["phase"] = "timeout 60s"
+            return self.state
         except Exception:
             pass
         try:
@@ -1135,6 +1153,10 @@ class LlamaProbe:
                 d["kv"] = min(1.0, occupied / nctx)
             d["alive"] = True
             d["spec_stale"] = busy
+        except TimeoutError:
+            self._timeout_until = time.monotonic() + 60
+            self.state["phase"] = "timeout 60s"
+            return self.state
         except Exception:
             pass
         d["pp"], d["tg"] = self.pp, self.tg
@@ -1153,6 +1175,10 @@ class LlamaProbe:
                 p = json.loads(self._get("/props"))
                 self.model = (os.path.basename(p.get("model_path", "")).replace(".gguf", "")
                               or p.get("model_name", ""))
+            except TimeoutError:
+                self._timeout_until = time.monotonic() + 60
+                self.state["phase"] = "timeout 60s"
+                return self.state
             except Exception:
                 pass
         d["model"] = self.model
@@ -1182,6 +1208,7 @@ def sample_llama_fleet(explicit_port=None):
             pr = _probes[port] = LlamaProbe(port, srv["host"])
         d = pr.sample()
         d["pid"], d["port"] = srv["pid"], port
+        d["flavor"] = srv.get("flavor", "llama.cpp")
         if not d.get("model"):
             d["model"] = srv["model_hint"]
         out.append(d)
@@ -1931,7 +1958,8 @@ def draw(w, gpus_data, cpu, mem, llamas, cfgs, procs):
     # one panel per server; the port/pid identifiers appear only when several run
     for d in llamas:
         port = d["port"]
-        ltitle = f"llama.cpp :{port} · {d.get('model', '')}" if multi else "llama.cpp"
+        flavor = d.get("flavor", "llama.cpp")
+        ltitle = f"{flavor} :{port} · {d.get('model', '')}" if multi else flavor
         lnote = f"pid {d.get('pid', '')}" if multi else ""
         blocks.append((ltitle, _llama_rows(d, bw), lnote))
         cfg = cfgs.get(port)
