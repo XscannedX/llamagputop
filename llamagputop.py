@@ -9,7 +9,7 @@ The design principles are simple. Read at the source. Everything comes from sysf
 
 It is highly portable. It discovers the hardware at runtime, so it runs on any Linux box, not just the one it was written on.
 
-Copyright 2026 XscannedX. MIT License.
+Copyright 2026 XscannedX <xscannedx@gmail.com>. MIT License.
 """
 import glob
 import os
