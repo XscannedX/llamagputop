@@ -780,7 +780,8 @@ def discover_llama_servers():
                 model = os.path.basename(cmd[cmd.index("-m") + 1]).replace(".gguf", "")
             except IndexError:
                 pass
-        flavor = "ikllama" if cmd and "ikcpu" in cmd[0] else "llama.cpp"
+        executable = os.path.basename(cmd[0]) if cmd else "llama-server"
+        flavor = "llama.cpp" if executable == "llama-server" else executable
         out.append({"pid": os.path.basename(p), "port": port,
                     "host": _host_of(cmd), "model_hint": model, "flavor": flavor})
     return sorted(out, key=lambda s: s["port"])
