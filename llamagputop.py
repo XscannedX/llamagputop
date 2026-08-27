@@ -12,6 +12,7 @@ It is highly portable. It discovers the hardware at runtime, so it runs on any L
 Copyright 2026 XscannedX <xscannedx@gmail.com>. MIT License.
 """
 import glob
+import math
 import os
 import re
 import struct
@@ -507,6 +508,33 @@ _NVSMI_FIELDS = ("index", "name", "utilization.gpu", "utilization.memory",
                  "power.limit", "clocks.sm", "clocks.mem")
 
 
+class _LlamaFeed(threading.Thread):
+    """llama.cpp is read over HTTP, and that read does not belong on the draw path.
+    Every other reader in this file is either instant (sysfs, /proc) or already threaded
+    (_IntelEngineFeed, _NvtopVramFeed, _NvidiaFeed); the llama probe alone blocked the
+    key/redraw loop for up to servers × endpoints × timeout, which is why its numbers
+    lagged behind every other stat on screen while the rest kept ticking once a second.
+    MEASURED 2026-08-25: :8181 answered NOTHING for the 78 s of a CPU prefill (three 20 s
+    timeouts back to back), so the panel could not have been kept live from the draw
+    loop at any timeout setting. Here a silent server costs the interface nothing: the
+    loop reads whatever snapshot is on hand and never waits for it."""
+    def __init__(self, port=None):
+        super().__init__(daemon=True)
+        self.port = port
+        self.data = []
+        self.at = 0.0
+        self.stop = False
+
+    def run(self):
+        while not self.stop:
+            try:
+                self.data = sample_llama_fleet(self.port)
+                self.at = time.monotonic()
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+
 class _NvidiaFeed(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -567,7 +595,6 @@ def discover_gpus():
     gpus, feeds = [], {}
     intel_vram = None
     nvidia_feed = None
-    intel_cards = []
     nvidia_seen = 0
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
         if "-" in os.path.basename(card):        # connector, not a card
@@ -821,6 +848,30 @@ def llama_spec_from_cmdline(port=None):
     return None, None, None
 
 
+def llama_ctx_from_cmdline(port=None):
+    """The context a server was ALLOCATED, read from its -c. The authoritative source for
+    the total, and the reason it is not derived instead: multiplying the per-slot context
+    from /slots by total_slots is right on one build and wrong on another. MEASURED
+    2026-08-25 across the four servers here — :7795 (-c 12288 -np 2) reports 6144 a slot,
+    so per×slots recovers 12288 and agrees; :7797 (-c 4096, --reranking) reports 4096 a
+    slot across FOUR slots, so the same arithmetic invents 16384 for a server that
+    allocated 4096. The command line does not need the inference."""
+    for p in glob.glob("/proc/[0-9]*"):
+        if (read(f"{p}/comm", "") or "") != "llama-server":
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if port is not None and _port_of(cmd) != str(port):
+            continue
+        for flag in ("-c", "--ctx-size"):
+            if flag in cmd:
+                try:
+                    return int(cmd[cmd.index(flag) + 1])
+                except (IndexError, ValueError):
+                    return None
+        return None
+    return None
+
+
 def llama_devices_from_cmdline(port=None):
     """The GPU backend devices a server was told to run on (-dev / --device), e.g.
     ['Vulkan0', 'Vulkan1']. An empty list means the flag was absent — which in llama.cpp
@@ -843,85 +894,202 @@ def llama_devices_from_cmdline(port=None):
     return []
 
 
+# Every flag llama-server accepts, grouped for reading. This list is the ORDER and the
+# LABELS — it is NOT the filter. Whatever it does not name still reaches the panel through
+# the "other" group below, computed as the complement of what these entries consumed. That
+# inversion is the whole point: the previous version showed a hardcoded subset, so a run
+# started with --dry-multiplier, --pooling, --jinja or --load-mode simply had no line
+# anywhere, and nothing said so. MEASURED 2026-08-25 on the four servers here — between 6
+# and 8 settings shown out of 15 to 18 flags actually passed. A curated list also ages
+# against llama.cpp: every flag added upstream would be invisible until someone edited
+# this file, which is the same defect one release later.
+_LLAMA_FLAG_GROUPS = (
+    ("loading", (
+        ("model", ("-m", "--model")), ("alias", ("-a", "--alias")),
+        ("ctx", ("-c", "--ctx-size")),
+        ("ngl", ("-ngl", "--gpu-layers", "--n-gpu-layers")),
+        ("split", ("-sm", "--split-mode")), ("tensor-split", ("-ts", "--tensor-split")),
+        ("devices", ("-dev", "--device")), ("main-gpu", ("-mg", "--main-gpu")),
+        ("rpc", ("--rpc",)),
+        ("flash-attn", ("-fa", "--flash-attn")),
+        ("threads", ("-t", "--threads")), ("threads-batch", ("-tb", "--threads-batch")),
+        ("batch", ("-b", "--batch-size")), ("ubatch", ("-ub", "--ubatch-size")),
+        ("slots", ("-np", "--parallel")),
+        ("mmap", ("--no-mmap", "--mmap")), ("mlock", ("--mlock",)),
+        # the label of a negating switch is the CONCEPT, never the flag: "no-warmup off"
+        # says warmup is ON, which is the opposite of what --no-warmup did
+        ("load-mode", ("--load-mode",)), ("warmup", ("--no-warmup", "--warmup")),
+        ("numa", ("--numa",)),
+        ("override-tensor", ("-ot", "--override-tensor")),
+        ("override-kv", ("--override-kv",)),
+        ("lora", ("--lora", "--lora-scaled")),
+        ("control-vector", ("--control-vector", "--control-vector-scaled")),
+        ("rope", ("--rope-scaling", "--rope-freq-base", "--rope-freq-scale")),
+        ("yarn", ("--yarn-orig-ctx", "--yarn-ext-factor", "--yarn-attn-factor",
+                  "--yarn-beta-slow", "--yarn-beta-fast")),
+    )),
+    ("cache", (
+        ("kv k", ("-ctk", "--cache-type-k")), ("kv v", ("-ctv", "--cache-type-v")),
+        ("cache-ram", ("--cache-ram",)), ("kv-unified", ("--kv-unified", "-kvu")),
+        ("cache-reuse", ("--cache-reuse",)), ("defrag", ("-dt", "--defrag-thold")),
+        ("context-shift", ("--context-shift", "--no-context-shift")),
+        ("cont-batching", ("-cb", "--cont-batching", "--no-cont-batching")),
+        ("keep", ("--keep",)), ("swa-full", ("--swa-full",)),
+    )),
+    ("sampling", (
+        ("temp", ("--temp", "--temperature")),
+        ("dynatemp", ("--dynatemp-range", "--dynatemp-exp")),
+        ("top-k", ("--top-k",)), ("top-p", ("--top-p",)), ("min-p", ("--min-p",)),
+        ("typical", ("--typical", "--typical-p")), ("top-nsigma", ("--top-nsigma",)),
+        ("xtc", ("--xtc-probability", "--xtc-threshold")),
+        ("repeat", ("--repeat-penalty",)), ("repeat-last-n", ("--repeat-last-n",)),
+        ("presence", ("--presence-penalty",)), ("frequency", ("--frequency-penalty",)),
+        # DRY (Do not Repeat Yourself) — the repetition sampler that works on n-grams
+        # instead of a flat token penalty. Five separate flags, none of which had a line.
+        ("dry-multiplier", ("--dry-multiplier",)), ("dry-base", ("--dry-base",)),
+        ("dry-allowed-length", ("--dry-allowed-length",)),
+        ("dry-penalty-last-n", ("--dry-penalty-last-n",)),
+        ("dry-breaker", ("--dry-sequence-breaker",)),
+        ("mirostat", ("--mirostat",)), ("mirostat-lr", ("--mirostat-lr",)),
+        ("mirostat-ent", ("--mirostat-ent",)),
+        ("seed", ("-s", "--seed")), ("samplers", ("--samplers", "--sampling-seq")),
+        ("ignore-eos", ("--ignore-eos",)), ("logit-bias", ("-l", "--logit-bias")),
+        ("grammar", ("--grammar", "--grammar-file")), ("json-schema", ("-j", "--json-schema")),
+        ("n-predict", ("-n", "--predict", "--n-predict")),
+    )),
+    ("reasoning", (
+        ("format", ("--reasoning-format",)), ("budget", ("--reasoning-budget",)),
+        ("effort", ("--reasoning-effort",)),
+        ("jinja", ("--jinja",)),
+        ("chat-template", ("--chat-template", "--chat-template-file")),
+    )),
+    ("role", (
+        ("pooling", ("--pooling",)),
+        ("embedding", ("--embedding", "--embeddings")),
+        ("reranking", ("--reranking", "--rerank")),
+    )),
+    ("speculative", (
+        ("type", ("--spec-type",)),
+        ("head", ("-md", "--model-draft", "--spec-draft-model")),
+        ("n-max", ("--spec-draft-n-max", "--draft-max", "--draft")),
+        ("n-min", ("--spec-draft-n-min", "--draft-min")),
+        # p-min is the adaptive cut-off: the draft stops proposing once its own
+        # confidence drops below it (default 0.00 = never cut). One of the biggest,
+        # most-tuned knobs — it reshapes the acceptance curve.
+        ("p-min", ("--spec-draft-p-min", "--draft-p-min")),
+        ("p-split", ("--spec-draft-p-split", "--draft-p-split")),
+        ("draft-dev", ("-devd", "--device-draft")),
+        ("draft-kv k", ("-ctkd", "--cache-type-k-draft", "--spec-draft-type-k")),
+        ("draft-kv v", ("-ctvd", "--cache-type-v-draft", "--spec-draft-type-v")),
+        ("draft-ngl", ("-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft")),
+        ("draft-ctx", ("-cd", "--ctx-size-draft")),
+    )),
+    ("server", (
+        ("host", ("--host",)), ("port", ("--port",)), ("path", ("--path",)),
+        ("api-key", ("--api-key", "--api-key-file")),
+        ("threads-http", ("--threads-http",)), ("timeout", ("-to", "--timeout")),
+        ("metrics", ("--metrics",)), ("slots endpoint", ("--slots", "--no-slots")),
+        ("props", ("--props",)), ("webui", ("--no-webui",)),
+        ("ssl", ("--ssl-key-file", "--ssl-cert-file")),
+    )),
+)
+
+# Values that must never be painted on a screen someone may screenshot. The tool is meant
+# to be run in front of other people and its README carries a panel dump.
+_SECRET_FLAGS = ("--api-key",)
+
+
+def _mask(flag, value):
+    if isinstance(value, str) and value and any(flag == s for s in _SECRET_FLAGS):
+        return "•" * 8 + f" ({len(value)} chars)"
+    return value
+
+
+def _parse_cmdline_flags(cmd):
+    """Command line to an ordered list of (flag, value) pairs, value True for a bare
+    switch. A token starting with '-' is a NEW FLAG only when it is not a number: the
+    previous parser had no such test, so `-np -1` read as a bare switch and the panel
+    printed `slots on` for a server running with automatic parallelism (measured on
+    :7799). `-1`, `-0.05` and `-1e-3` are values; `-np` and `--top-k` are flags."""
+    def is_flag(tok):
+        if not tok.startswith("-"):
+            return False
+        try:
+            float(tok)
+        except ValueError:
+            return True
+        return False
+
+    out, i = [], 0
+    while i < len(cmd):
+        a = cmd[i]
+        if is_flag(a):
+            if i + 1 < len(cmd) and not is_flag(cmd[i + 1]):
+                out.append((a, cmd[i + 1])); i += 2
+            else:
+                out.append((a, True)); i += 1
+        else:
+            i += 1
+    return out
+
+
 def llama_settings_from_cmdline(port=None):
-    """The active server configuration, read from its command line and organized by
-    theme — not the raw argv, but the settings that actually shape a run: what was
-    loaded and how it is split, the cache, the sampler, reasoning and speculative.
-    Nothing that was left at its default appears here (it is not on the command line).
-    With `port` given, only the server on that port is read."""
+    """The active server configuration, read from its command line and organized by theme.
+    EVERY flag it was launched with appears: the themed groups above give the known ones a
+    label and a place, and anything they do not name lands in `other`, verbatim, so a flag
+    this file has never heard of is still on screen. Nothing that was left at its default
+    appears (it is not on the command line). With `port` given, only that server is read.
+
+    NOTE ON THE SAMPLING GROUP, because the word is narrower than it looks: what is here is
+    the server's DEFAULT, applied only when a request does not carry its own. A client that
+    sends temperature or repeat_penalty in the request body overrides it, and the panel
+    cannot see that from /proc — the live values are in the slot, not the command line."""
     for p in glob.glob("/proc/[0-9]*"):
         if (read(f"{p}/comm", "") or "") != "llama-server":
             continue
         cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
         if port is not None and _port_of(cmd) != str(port):
             continue
-        opt = {}
-        i = 0
-        while i < len(cmd):
-            a = cmd[i]
-            if a.startswith("-"):
-                if i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
-                    opt[a] = cmd[i + 1]; i += 2
-                else:
-                    opt[a] = True; i += 1
-            else:
-                i += 1
-
-        def g(*flags, d=None):
-            for f in flags:
-                if f in opt:
-                    return opt[f]
-            return d
-
-        base = lambda v: os.path.basename(v).replace(".gguf", "") if isinstance(v, str) else None
-        # draft KV cache type (-ctkd/-ctvd): shown, like the main cache, only when the run
-        # set it — a draft at higher KV precision drafts a touch better, at more memory.
-        _dkv_k = g("-ctkd", "--cache-type-k-draft", "--spec-draft-type-k")
-        _dkv_v = g("-ctvd", "--cache-type-v-draft", "--spec-draft-type-v")
-        draft_kv = f"{_dkv_k or 'f16'}/{_dkv_v or 'f16'}" if (_dkv_k or _dkv_v) else None
-        return {
-            "loading": [
-                ("model", base(g("-m", "--model"))),
-                ("ctx", g("-c", "--ctx-size")),
-                ("ngl", g("-ngl", "--gpu-layers", "--n-gpu-layers")),
-                ("split", g("-sm", "--split-mode")),
-                ("tensor-split", g("-ts", "--tensor-split")),
-                ("devices", g("-dev", "--device")),
-                ("flash-attn", g("-fa", "--flash-attn")),
-                ("threads", g("-t", "--threads")),
-                ("batch", f"{g('-b', '--batch-size') or ''}/{g('-ub', '--ubatch-size') or ''}".strip("/") or None),
-                ("slots", g("-np", "--parallel")),
-            ],
-            "cache": [
-                ("kv k/v", f"{g('-ctk', '--cache-type-k') or 'f16'}/{g('-ctv', '--cache-type-v') or 'f16'}"),
-                ("cache-ram", g("--cache-ram")),
-                ("kv-unified", True if "--kv-unified" in opt else None),
-            ],
-            "sampling": [
-                ("temp", g("--temp")), ("top-k", g("--top-k")), ("top-p", g("--top-p")),
-                ("min-p", g("--min-p")), ("repeat", g("--repeat-penalty")),
-            ],
-            "reasoning": [
-                ("format", g("--reasoning-format")), ("budget", g("--reasoning-budget")),
-                ("effort", g("--reasoning-effort")),
-            ],
-            "speculative": [
-                ("type", g("--spec-type")),
-                ("head", base(g("-md", "--model-draft", "--spec-draft-model"))),
-                ("n-max", g("--spec-draft-n-max")),
-                ("n-min", g("--spec-draft-n-min")),
-                # p-min is the adaptive cut-off: the draft stops proposing once its own
-                # confidence drops below it (default 0.00 = never cut). One of the biggest,
-                # most-tuned knobs — it reshapes the acceptance curve — and was missing here.
-                ("p-min", g("--spec-draft-p-min", "--draft-p-min")),
-                ("p-split", g("--spec-draft-p-split", "--draft-p-split")),
-                ("draft-dev", g("-devd", "--device-draft")),
-                ("draft-kv", draft_kv),
-                ("draft-ngl", g("-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft")),
-                ("draft-ctx", g("-cd", "--ctx-size-draft")),
-            ],
-        }
+        return settings_from_cmd(cmd)
     return None
+
+
+def settings_from_cmd(cmd):
+    """The grouping itself, split out from the /proc walk so it can be exercised on a
+    command line that no process is running — including flags this build has never seen."""
+    pairs = _parse_cmdline_flags(cmd)
+    base = lambda v: os.path.basename(v).replace(".gguf", "") if isinstance(v, str) else v
+    used = set()                       # indices of pairs a themed entry claimed
+    out = {}
+    for group, entries in _LLAMA_FLAG_GROUPS:
+        rows = []
+        for label, aliases in entries:
+            hits = [(k, (flag, val)) for k, (flag, val) in enumerate(pairs)
+                    if flag in aliases]
+            if not hits:
+                continue
+            shown = []
+            for k, (flag, val) in hits:
+                used.add(k)
+                v = _mask(flag, val)
+                if label in ("model", "head") or flag in ("--lora", "--lora-scaled",
+                                                          "--control-vector"):
+                    v = base(v)
+                # a negating switch says what it turns OFF, so print the flag itself
+                # rather than a bare "on" that reads as the opposite
+                if v is True:
+                    v = "off" if flag.startswith("--no-") else "on"
+                shown.append(str(v))
+            rows.append((label, " ".join(shown)))
+        if rows:
+            out[group] = rows
+    # THE COMPLEMENT, and it is what makes this list an ordering instead of a filter
+    leftover = [(flag, val) for k, (flag, val) in enumerate(pairs) if k not in used]
+    if leftover:
+        out["other"] = [(flag.lstrip("-"),
+                         ("on" if val is True else str(_mask(flag, val))))
+                        for flag, val in leftover]
+    return out
 
 
 # File capabilities put a binary in "secureexec" mode, which the kernel marks
@@ -1015,14 +1183,24 @@ class LlamaProbe:
         self.host = host or "127.0.0.1"
         self.state = {"alive": False}
         self.cnt = {}
-        self.tg = self.pp = 0.0
-        self._dhist = deque(maxlen=12)     # (time, n_decoded) trail for the live rate
-        self._dlast = 0
+        # None means NOT MEASURABLE and is drawn as a dash with the reason. 0.0 would be
+        # a claim ("this server prefills at zero tokens a second") that no source ever
+        # made — and with /metrics off, which is the default, that claim was the only
+        # thing the prefill field ever showed.
+        self.tg = self.pp = None
+        self.tg_last = self.pp_last = None   # rate of the last COMPLETED request
+        # 6 s of trail at the fastest refresh (0.5 s) needs 13 slots, not 12: the old cap
+        # silently shortened the window at the very rate a user picks to watch it closely.
+        self._dhist = deque(maxlen=32)       # (time, n_decoded) — generation
+        self._phist = deque(maxlen=32)       # (time, n_prompt_processed) — prefill
+        self._dlast = self._plast = 0
+        self._busy = False
+        self.ctx = self.ctx_total = self.slots = None   # server FACTS, survive a bad tick
         self.model = ""
         self.model_at = 0.0
         self._rf = None                    # reasoning format (from /slots, survives ticks)
 
-    def _get(self, path, timeout=1.2):
+    def _get(self, path, timeout=2.5):
         import urllib.request
         import urllib.error
         try:
@@ -1035,27 +1213,115 @@ class LlamaProbe:
                 raise TimeoutError()
             raise
 
+    def _backoff(self):
+        """A server that stopped answering must not be drawn as a server answering
+        ZEROS. Arm the 60 s countdown and hand back the LAST GOOD state, marked stale:
+        ctx, kv and model stay on screen and only the two speeds go to "not measurable".
+        Rebuilding the dict from defaults here is what made the context appear to reset."""
+        # A FIXED sixty seconds was wrong in both directions at once: far too long a
+        # penalty for one slow answer, and useless against a server that will be silent
+        # for longer than that anyway. MEASURED 2026-08-25 on :8181 during a 78 s CPU
+        # prefill — /slots did not answer AT ALL (three consecutive 20 s timeouts, then
+        # 13.83 s the moment the prefill ended, zero replies under 1.2 s). No timeout
+        # value would have helped, and the 60 s blackout simply hid the whole run. So:
+        # retry immediately once, then back away geometrically, and never for long.
+        # capped so the ladder below never computes 2**700 on a long outage just to throw
+        # it away at the min(): the wait is bounded at 5 s from the fourth failure on
+        self._fails = min(getattr(self, "_fails", 0) + 1, 8)
+        # capped low ON PURPOSE: with the fan-out above, a probe that keeps failing no
+        # longer slows anything else down, so there is nothing to buy by waiting longer —
+        # and every second of wait is a second of missing the recovery
+        self._timeout_until = time.monotonic() + (
+            0 if self._fails < 2 else min(2 ** (self._fails - 1), 5))
+        s = self._blank()
+        s.update(self.state)               # keep whatever the last good tick knew
+        s.update(phase="not answering", stale=True, pp=None, tg=None,
+                 pp_last=self.pp_last, tg_last=self.tg_last)
+        self.state = s
+        return s
+
+    # A prefill that lasts about as long as the poll interval CANNOT be measured by
+    # polling: on :7795 a 4001-token prefill ran in 1.94 s and left two usable samples,
+    # from which the slope reads ~790 t/s against the 2065 the server timed. So the live
+    # prefill is published only once it has been running longer than this — a big prompt
+    # on CPU takes a minute and is genuinely samplable, a GPU prefill is over before the
+    # second tick. Below the threshold the completed-request figure from /metrics is used
+    # instead, and it is exact (2068 against 2065.45, measured 2026-08-25). Publishing the
+    # slope anyway would be manufacturing precision, which is the defect being fixed here
+    # wearing better clothes.
+    _PREFILL_MIN_SPAN = 2.0
+
+    @staticmethod
+    def _slope(hist, cur, prev, minspan=0.6, window=6.0, anchor_zero=False):
+        """Tokens per second from a (time, counter) trail, or None while the trail is
+        too short to say. Called only while the slot is BUSY — that restriction is the
+        fix, not a detail. Feeding it a finished request's counter, which llama.cpp
+        leaves standing in the slot, makes the window slide off the end of the work: the
+        numerator shrinks while the denominator stays ~6 s, so the reading decays, and
+        once the window is entirely past the request the delta is 0 and the guard stops
+        updating — leaving the last decayed value frozen on screen. MEASURED 2026-08-25
+        on :8181, whose own timings reported 29.93 t/s: 29.7, 27.8, 24.7, 21.1, 17.7,
+        14.2, 12.7, 9.4, 5.4, 1.606, then 1.606 for as long as anyone watched."""
+        now = time.monotonic()
+        if cur < prev:                     # counter restarted: a new request began
+            hist.clear()
+        # WHERE THE TRAIL STARTS is not the same question for the two rates, and using one
+        # answer for both is wrong in opposite directions. Prefill starts at zero tokens
+        # processed, so the zero IS the anchor and dropping it loses the start of the work.
+        # Generation also starts at zero decoded, but that zero sits at the END of prefill:
+        # anchoring there would divide the generated tokens by generation time PLUS prefill
+        # time and report a speed the model never ran at.
+        if cur <= 0 and not anchor_zero:
+            return None
+        hist.append((now, cur))
+        while len(hist) >= 2 and now - hist[0][0] > window:
+            hist.popleft()
+        t0, c0 = hist[0]
+        if len(hist) >= 2 and now - t0 >= minspan and cur - c0 > 0:
+            return (cur - c0) / (now - t0)
+        return None
+
+    def _blank(self):
+        """The full SHAPE of a sample. Server FACTS (context, slot count, model) describe
+        the SERVER and not this tick, so they are seeded from the last good sample: one
+        failed request must not be able to make the panel read "ctx 0". Only the per-tick
+        MEASUREMENTS start empty. Every exit from sample() returns this shape — handing
+        back a partial dict pushes the job of inventing defaults onto nine render sites,
+        which is how a missing key becomes a zero on screen."""
+        return {"alive": False, "phase": "off", "pp": None, "tg": None,
+             "pp_last": self.pp_last, "tg_last": self.tg_last, "kv": None,
+             "ctx": self.ctx, "ctx_total": self.ctx_total, "slots": self.slots,
+             "model": self.model, "spec": None, "tok_step": None,
+             "spec_acc": 0, "spec_draft": 0, "spec_pos": [], "active": None, "queued": None,
+             "pp_life": None, "tg_life": None, "spec_type": None, "spec_head": None,
+             "spec_nmax": None, "spec_stale": False, "cache_hit": 0, "prompt_new": 0,
+             "max_tok": None, "reuse": None, "budget": 0, "decoded": 0, "kv_used": 0,
+             "metrics_off": False, "slots_off": False, "stale": False, "kv_cap": None,
+             "active_metric": None}
+
     def sample(self):
         import json, time
         now = time.monotonic()
         timeout_until = getattr(self, '_timeout_until', 0)
         if now < timeout_until:
-            self.state["phase"] = f"timeout {int(timeout_until - now)}s"
-            return self.state
-        d = {"alive": False, "phase": "off", "pp": 0.0, "tg": 0.0, "kv": None,
-             "ctx": 0, "model": self.model, "spec": None, "tok_step": None,
-             "spec_acc": 0, "spec_draft": 0, "spec_pos": [], "active": 0, "queued": 0,
-             "pp_life": 0.0, "tg_life": 0.0, "spec_type": None, "spec_head": None,
-             "spec_nmax": None, "spec_stale": False, "cache_hit": 0, "prompt_new": 0,
-             "max_tok": 0, "reuse": None, "budget": 0, "decoded": 0, "kv_used": 0}
+            s = self._blank()
+            s.update(self.state)
+            s.update(phase=f"not answering ({int(timeout_until - now) + 1}s)",
+                     stale=True, pp=None, tg=None)
+            self.state = s
+            return s
+        d = self._blank()
+        metrics_ok = False
         try:
             m = {}
             raw = self._get("/metrics")
-            # Old / unconfigured builds return a JSON error body on /metrics;
-            # treat it as "no counters" but mark the server alive so the /slots
-            # block below still runs.
+            # A build started without --metrics answers 501 with a JSON error body. That
+            # is NOT "every counter reads zero", it is "no counter exists" — and reading
+            # it as zeros is exactly what pinned prefill, active, queued and prompt-reuse
+            # to 0 on every server here (all four, measured 2026-08-25).
             if raw.lstrip().startswith("{"):
                 d["alive"] = True
+                d["metrics_off"] = True
             else:
                 for line in raw.splitlines():
                     if line.startswith("#") or " " not in line:
@@ -1066,103 +1332,175 @@ class LlamaProbe:
                     except ValueError:
                         pass
                 d["alive"] = True
-            d["active"] = int(m.get("llamacpp:requests_processing", 0))
-            d["queued"] = int(m.get("llamacpp:requests_deferred", 0))
-            # prompt-cache reuse (how well --cache-reuse pays off) and the largest
-            # context ever seen against what -c allocated
-            d["cache_hit"] = int(m.get("llamacpp:prompt_tokens_cached_total", 0))
-            d["prompt_new"] = int(m.get("llamacpp:prompt_tokens_total", 0))
-            d["max_tok"] = int(m.get("llamacpp:n_tokens_max", 0))
-            _tot = d["cache_hit"] + d["prompt_new"]
-            d["reuse"] = (d["cache_hit"] / _tot) if _tot else None
-            draft = m.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
-            acc = m.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
-            d["spec_draft"], d["spec_acc"] = draft, acc
-            d["spec"] = (acc / draft) if draft else None
-            drafts = m.get("llamacpp:spec_decode_num_drafts_total", 0)
-            if drafts:
-                i, pos = 0, []
-                while True:
-                    v = m.get(f'llamacpp:spec_decode_num_accepted_tokens_per_pos_total{{position="{i}"}}')
-                    if v is None:
-                        break
-                    pos.append(v / drafts)
-                    i += 1
-                d["spec_pos"] = pos
-                d["tok_step"] = 1.0 + acc / drafts
-            C = ("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total",
-                 "llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total")
-            c = {k: m.get(k, 0.0) for k in C}
-            if self.cnt:
-                if c[C[0]] - self.cnt[C[0]] > 0 and c[C[1]] - self.cnt[C[1]] > 0:
-                    self.pp = (c[C[0]] - self.cnt[C[0]]) / (c[C[1]] - self.cnt[C[1]])
-                if c[C[2]] - self.cnt[C[2]] > 0 and c[C[3]] - self.cnt[C[3]] > 0:
-                    self.tg = (c[C[2]] - self.cnt[C[2]]) / (c[C[3]] - self.cnt[C[3]])
-            self.cnt = c
-            d["pp_life"] = c[C[0]] / c[C[1]] if c[C[1]] else 0.0
-            d["tg_life"] = c[C[2]] / c[C[3]] if c[C[3]] else 0.0
+                metrics_ok = bool(m)
+                d["metrics_off"] = not metrics_ok
+            if metrics_ok:
+                d["active"] = int(m.get("llamacpp:requests_processing", 0))
+                d["queued"] = int(m.get("llamacpp:requests_deferred", 0))
+                # prompt-cache reuse (how well --cache-reuse pays off) and the largest
+                # context ever seen against what -c allocated
+                d["cache_hit"] = int(m.get("llamacpp:prompt_tokens_cached_total", 0))
+                d["prompt_new"] = int(m.get("llamacpp:prompt_tokens_total", 0))
+                d["max_tok"] = int(m.get("llamacpp:n_tokens_max", 0)) or None
+                # a build that does not EXPORT the cache counter is not a build with zero
+                # reuse: :8181 (ik_llama) exports 10 counters where mainline exports 15,
+                # and reading the gap as a value would print "prompt reuse 0.0%" about a
+                # thing nobody measured — the same defect as prefill, one field along
+                _tot = d["cache_hit"] + d["prompt_new"]
+                d["reuse"] = (d["cache_hit"] / _tot) if (
+                    _tot and "llamacpp:prompt_tokens_cached_total" in m) else None
+                draft = m.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
+                acc = m.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
+                d["spec_draft"], d["spec_acc"] = draft, acc
+                d["spec"] = (acc / draft) if draft else None
+                drafts = m.get("llamacpp:spec_decode_num_drafts_total", 0)
+                if drafts:
+                    i, pos = 0, []
+                    while True:
+                        v = m.get(f'llamacpp:spec_decode_num_accepted_tokens_per_pos_total{{position="{i}"}}')
+                        if v is None:
+                            break
+                        pos.append(v / drafts)
+                        i += 1
+                    d["spec_pos"] = pos
+                    d["tok_step"] = 1.0 + acc / drafts
+                C = ("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total",
+                     "llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total")
+                c = {k: m.get(k, 0.0) for k in C}
+                # a finished request moves these counters; their delta is the rate of the
+                # request that just ended, which is the LAST rate, never the current one
+                if self.cnt:
+                    if c[C[0]] - self.cnt[C[0]] > 0 and c[C[1]] - self.cnt[C[1]] > 0:
+                        self.pp_last = (c[C[0]] - self.cnt[C[0]]) / (c[C[1]] - self.cnt[C[1]])
+                    if c[C[2]] - self.cnt[C[2]] > 0 and c[C[3]] - self.cnt[C[3]] > 0:
+                        self.tg_last = (c[C[2]] - self.cnt[C[2]]) / (c[C[3]] - self.cnt[C[3]])
+                self.cnt = c
+                d["pp_life"] = c[C[0]] / c[C[1]] if c[C[1]] else None
+                d["tg_life"] = c[C[2]] / c[C[3]] if c[C[3]] else None
+                d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
         except TimeoutError:
-            self._timeout_until = time.monotonic() + 60
-            self.state["phase"] = "timeout 60s"
-            return self.state
+            return self._backoff()
         except Exception:
             pass
+        x = {}
+        _am = d["active"]                  # what /metrics claimed, kept for comparison
         try:
             s = json.loads(self._get("/slots"))
-            x = s[0] if isinstance(s, list) and s else {}
-            # New builds have is_processing (bool); old builds instead have
-            # state (int): 0=idle, 1=started/prefill, 2=prompt_done, 3=gen
-            st = x.get("state")
-            busy = bool(x.get("is_processing")) or (st is not None and st != 0)
-            nt = x.get("next_token")
-            nt = nt[0] if isinstance(nt, list) and nt else nt if isinstance(nt, dict) else {}
-            dec = nt.get("n_decoded", 0) or 0
+            if not isinstance(s, list):
+                # /slots disabled (--no-slots) or an error body: there is no live phase to
+                # read. Say so — do NOT let ctx, kv and the phase fall through as zeros.
+                d["slots_off"] = True
+                raise ValueError("slots endpoint unavailable")
+            x = s[0] if s else {}
+            # EVERY SLOT, not slot 0. A server started with -np N hands a request to
+            # whichever slot is free, so reading s[0] alone makes the panel say "idle"
+            # while the server generates on another slot — and show that slot's LEFTOVER
+            # n_decoded, which is the fossil that then froze on screen. MEASURED
+            # 2026-08-25 on :8181 (-np 2): a request ran to completion on slot 1 at
+            # 29.88 t/s while slot 0 sat at state 0 holding n_decoded from an older run.
+            # Both generative servers on this box run -np 2, so about half of all work
+            # was invisible.
+            def _slot_busy(sl):
+                # new builds: is_processing (bool). old builds: state (int),
+                # 0=idle 1=started/prefill 2=prompt_done 3=gen
+                stx = sl.get("state")
+                return bool(sl.get("is_processing")) or (stx is not None and stx != 0)
+
+            def _slot_next(sl):
+                nx = sl.get("next_token")
+                return nx[0] if isinstance(nx, list) and nx else nx if isinstance(nx, dict) else {}
+
+            busy_slots = [sl for sl in s if _slot_busy(sl)]
+            busy = bool(busy_slots)
+            # a slot that is not working carries the residue of its last request: it must
+            # count towards the KV fill (those cells ARE occupied) and never towards a rate
+            dec = sum((_slot_next(sl).get("n_decoded") or sl.get("n_decoded") or 0)
+                      for sl in busy_slots)
             d["decoded"] = dec
             # n_remain is the budget left (n_predict - generated), -1 when unlimited;
             # near its ceiling means the model is not stopping on its own
-            resta = nt.get("n_remain")
-            d["budget"] = (dec + resta) if isinstance(resta, int) and resta >= 0 else 0
-            now = time.monotonic()
-            # live generation rate. The /metrics counters only advance when a request
-            # finishes, so during a stream they read zero — the slot's decode progress
-            # is the only live source. Keep a short (time, n_decoded) trail and take its
-            # slope; clear it when the counter resets at the start of a new request.
-            if dec < self._dlast:
-                self._dhist.clear()
-            self._dlast = dec
-            if dec > 0:
-                self._dhist.append((now, dec))
-                while len(self._dhist) >= 2 and now - self._dhist[0][0] > 6.0:
-                    self._dhist.popleft()
-                t0, d0 = self._dhist[0]
-                if len(self._dhist) >= 2 and now - t0 >= 0.8 and dec - d0 > 0:
-                    self.tg = (dec - d0) / (now - t0)
-            if st is not None:
-                # Old-format slot with explicit state enum — more precise
-                d["phase"] = {1: "prefill", 2: "prefill", 3: "generating"}.get(st, "idle")
+            _bn = _slot_next(busy_slots[0]) if busy_slots else {}
+            resta = _bn.get("n_remain")
+            _bdec = (_bn.get("n_decoded") or 0) if busy_slots else 0
+            d["budget"] = (_bdec + resta) if isinstance(resta, int) and resta >= 0 else 0
+            _nproc = sum((sl.get("n_prompt_tokens_processed") or 0) for sl in busy_slots)
+            # the number of slots actually working is a LIVE reading of the queue depth,
+            # and unlike llamacpp:requests_processing it needs no --metrics
+            # DIRECT observation beats a counter here: the number of slots actually
+            # working is read from the slots themselves, needs no --metrics, and cannot
+            # disagree with the phase drawn one line above it
+            d["active"] = len(busy_slots)
+            d["active_metric"] = _am
+            # the set of working slots changing mid-window would step the summed counter
+            # and inflate one slope reading; close the trail instead of publishing it
+            _ids = tuple(sorted(sl.get("id") for sl in busy_slots))
+            if _ids != getattr(self, "_bids", ()):
+                self._dhist.clear(); self._phist.clear()
+                self._dlast = self._plast = 0
+            self._bids = _ids
+            # ---- live rates, and ONLY while the slot is busy ----------------------
+            # The /metrics counters move only when a request finishes, so during a stream
+            # the slot's own progress is the sole live source. When the slot goes idle
+            # llama.cpp LEAVES the counters standing, so the trail must be closed here,
+            # not left to age out: what stands after a request is the LAST rate, and it
+            # is labelled as such rather than dressed up as the current one.
+            if busy:
+                r = self._slope(self._dhist, dec, self._dlast)
+                if r is not None:
+                    self.tg = r
+                r = self._slope(self._phist, _nproc, self._plast,
+                                minspan=self._PREFILL_MIN_SPAN, anchor_zero=True)
+                if r is not None:
+                    self.pp = r
+            elif self._busy:               # the tick the request ended: latch and close
+                if self.tg is not None:
+                    self.tg_last = self.tg
+                if self.pp is not None:
+                    self.pp_last = self.pp
+                self._dhist.clear(); self._phist.clear()
+                self.tg = self.pp = None
             else:
-                d["phase"] = "generating" if (busy and dec > 0) else "prefill" if busy else "idle"
+                self.tg = self.pp = None
+            self._dlast, self._plast, self._busy = dec, _nproc, busy
+            d["phase"] = "generating" if (busy and dec > 0) else "prefill" if busy else "idle"
             nctx = x.get("n_ctx", 0) or 0
-            d["ctx"] = nctx
-            # New builds have n_prompt_tokens*; old builds don't — fall back to
-            # the decoded count alone (incomplete but honest)
-            _npt = x.get("n_prompt_tokens", 0) or 0
-            _npc = (x.get("n_prompt_tokens_cache", 0) or 0) \
-                 + (x.get("n_prompt_tokens_processed", 0) or 0)
-            occupied = (max(_npt, _npc) + dec) if (_npt or _npc) else dec
-            d["kv_used"] = occupied
+            if not isinstance(nctx, int) or nctx < 0:
+                nctx = 0                       # a negative context is not a context
             if nctx:
-                d["kv"] = min(1.0, occupied / nctx)
+                self.ctx = nctx            # per-SLOT context; the total comes from /props
+                d["ctx"] = nctx
+            # New builds have n_prompt_tokens*; old builds don't — fall back to
+            # the decoded count alone (incomplete but honest). Summed over EVERY slot,
+            # busy or not, because an idle slot still holds its conversation in the cache.
+            occupied = 0
+            for sl in s:
+                _npt = sl.get("n_prompt_tokens", 0) or 0
+                _npc = (sl.get("n_prompt_tokens_cache", 0) or 0) \
+                     + (sl.get("n_prompt_tokens_processed", 0) or 0)
+                _sd = _slot_next(sl).get("n_decoded") or sl.get("n_decoded") or 0
+                occupied += (max(_npt, _npc) + _sd) if (_npt or _npc) else _sd
+            d["kv_used"] = occupied
+            # denominator: the WHOLE allocation when several slots share it, so the sum
+            # above is compared against the capacity it was actually drawn from
+            _cap = d["ctx_total"] or ((d["ctx"] or 0) * (d["slots"] or 1)) or d["ctx"]
+            if _cap:
+                d["kv"] = min(1.0, occupied / _cap)
+                d["kv_cap"] = _cap
             d["alive"] = True
             d["spec_stale"] = busy
+            self._fails = 0                # it answered: the retry ladder resets
         except TimeoutError:
-            self._timeout_until = time.monotonic() + 60
-            self.state["phase"] = "timeout 60s"
-            return self.state
+            return self._backoff()
         except Exception:
-            pass
+            if not d["slots_off"]:
+                d["stale"] = True          # kept last-good ctx/kv rather than zeroing them
         d["pp"], d["tg"] = self.pp, self.tg
-        # reasoning format is in the slot data itself (both old and new builds)
+        d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
+        # reasoning format is in the slot data itself (both old and new builds).
+        # GUARDED, and the guard was removed once and put back: `x` is seeded to {} above,
+        # which covers "/slots failed", but NOT "/slots answered with a list whose items are
+        # not objects" — there `.get` raises and takes the whole sample down with it, so a
+        # server that is merely odd gets drawn as one that is not answering.
         try:
             _rf = (x.get("params", {}) or {}).get("reasoning_format") \
                   or x.get("reasoning_format")
@@ -1177,13 +1515,28 @@ class LlamaProbe:
                 p = json.loads(self._get("/props"))
                 self.model = (os.path.basename(p.get("model_path", "")).replace(".gguf", "")
                               or p.get("model_name", ""))
+                # /slots reports the PER-SLOT context (-c divided by -np); the config panel
+                # reads -c off the command line. Both are true and they are different
+                # numbers under the same word — :7795 shows 6144 here and 12288 there.
+                # Carry both so the panel can say which is which instead of picking one.
+                _sl = p.get("total_slots")
+                _per = (p.get("default_generation_settings") or {}).get("n_ctx")
+                # the total comes from -c, never from per-slot × slots (see
+                # llama_ctx_from_cmdline for the two builds that disagree)
+                _tot = llama_ctx_from_cmdline(self.port) or p.get("n_ctx")
+                if isinstance(_sl, int) and _sl > 0:
+                    self.slots = _sl
+                if _tot:
+                    self.ctx_total = _tot
+                if not self.ctx and _per:
+                    self.ctx = _per
             except TimeoutError:
-                self._timeout_until = time.monotonic() + 60
-                self.state["phase"] = "timeout 60s"
-                return self.state
+                return self._backoff()
             except Exception:
                 pass
         d["model"] = self.model
+        d["ctx"] = d["ctx"] or self.ctx
+        d["ctx_total"], d["slots"] = self.ctx_total, self.slots
         if d["alive"]:
             d["spec_type"], d["spec_head"], d["spec_nmax"] = llama_spec_from_cmdline(self.port)
         self.state = d
@@ -1201,15 +1554,42 @@ def sample_llama_fleet(explicit_port=None):
         servers.append({"pid": "?", "port": str(explicit_port),
                         "host": "127.0.0.1", "model_hint": ""})
         servers.sort(key=lambda s: s["port"])
-    active, out = set(), []
+    active, todo = set(), []
     for srv in servers:
         port = srv["port"]
         active.add(port)
         pr = _probes.get(port)
         if pr is None:
             pr = _probes[port] = LlamaProbe(port, srv["host"])
-        d = pr.sample()
-        d["pid"], d["port"] = srv["pid"], port
+        todo.append((srv, pr))
+    # Probe every server AT ONCE. Read in a row, ONE server that has stopped answering
+    # costs every other server its own timeout — measured on this box, a silent :8181
+    # held each pass for 2.5 s, so the three healthy servers refreshed six times slower
+    # than they could. That coupling is also what forced the retry ladder to back away
+    # for 16 s at a time, which then risks missing the moment the slow one recovers.
+    # With the fan-out a failing probe costs nothing but its own thread, so the ladder
+    # stays short. Probes are created above, in this thread: each one is then touched by
+    # exactly one worker, and the _probes dict itself is never mutated concurrently.
+    results = [None] * len(todo)
+
+    def _one(i, pr):
+        try:
+            results[i] = pr.sample()
+        except Exception:
+            results[i] = None
+
+    ths = [threading.Thread(target=_one, args=(i, pr), daemon=True)
+           for i, (_s, pr) in enumerate(todo)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=10.0)
+    out = []
+    for (srv, pr), d in zip(todo, results):
+        if d is None:                      # worker still stuck or it raised
+            d = dict(pr._blank()); d.update(pr.state or {})
+            d["phase"], d["stale"] = "not answering", True
+        d["pid"], d["port"] = srv["pid"], srv["port"]
         d["flavor"] = srv.get("flavor", "llama.cpp")
         if not d.get("model"):
             d["model"] = srv["model_hint"]
@@ -1255,8 +1635,12 @@ def probe():
         print("\n[llama.cpp] no server found")
     for ll in fleet:
         print(f"\n[llama.cpp :{ll['port']}] pid={ll['pid']} alive={ll['alive']} "
-              f"model={ll['model'] or '—'} phase={ll['phase']} pp={ll['pp']:.0f} "
-              f"tg={ll['tg']:.1f} spec={ll['spec']} head={ll['spec_head']} type={ll['spec_type']}")
+              f"model={ll['model'] or '—'} phase={ll['phase']} "
+              f"pp={_n(ll.get('pp'))}/last {_n(ll.get('pp_last'))} "
+              f"tg={_n(ll.get('tg'), 1)}/last {_n(ll.get('tg_last'), 1)} "
+              f"ctx={ll.get('ctx')} tot={ll.get('ctx_total')} slots={ll.get('slots')} "
+              f"metrics_off={ll.get('metrics_off')} spec={ll['spec']} "
+              f"head={ll['spec_head']} type={ll['spec_type']}")
     for f in feeds.values():
         f.stop = True
 
@@ -1271,7 +1655,22 @@ _session = {"start": None, "t": None, "energy_j": 0.0}   # cumulative energy sin
 
 
 def record(key, value):
-    HIST.setdefault(key, deque(maxlen=3600)).append(value if value is not None else 0)
+    """Append one sample to a series. NON-FINITE VALUES NEVER GET IN, and this is the only
+    door, so no series can hold one. `float()` accepts the strings "nan" and "inf" without
+    raising, and three readers parse external tools that way — intel_gpu_top, nvtop and
+    nvidia-smi — so a sensor printing either would put it straight into the history; the
+    `num()` helper on the nvidia side only catches ValueError, which those do not raise.
+    Downstream a NaN raised ValueError inside the sparkline and an inf raised OverflowError
+    in the step ladder, either of which kills the whole interface. The existing `sane()`
+    guard does not cover this path: it is applied to clocks, temperatures, watts and
+    voltage, not to utilisation or VRAM, which are exactly what is charted.
+    A bad sample HOLDS THE PREVIOUS ONE rather than being dropped: this is a fixed-cadence
+    series where one column is one tick, so a missing sample still has to occupy its
+    column, and holding is what the tool already does elsewhere for an out-of-range read."""
+    s = HIST.setdefault(key, deque(maxlen=3600))
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        value = s[-1] if s else 0
+    s.append(value)
 
 
 def median_dev(key, window=60):
@@ -1663,6 +2062,16 @@ def _llama_config_rows(cfg, width):
         for i, r in enumerate(_flow(cells, inner - lab)):
             prefix = [(f"{group:<{lab}}", SER)] if i == 0 else [(" " * lab, 0)]
             rows.append(prefix + r)
+        # A sampler value on the command line is what the server falls back to, NOT what
+        # the model is running at: a client that puts temperature or repeat_penalty in the
+        # request body wins, and /proc cannot see that. Measured 2026-08-25 against a
+        # server whose slot went from the values one client sent to another client's the
+        # moment the second one called. True and read as false is the expensive kind of
+        # wrong, and the correction costs one dim line that only appears when it applies.
+        if group == "sampling":
+            rows.append([(" " * lab, 0),
+                         ("↑ server defaults — a request carrying its own overrides them",
+                          DIM)])
     return rows or [[("server started with all defaults", DIM)]]
 
 
@@ -1729,19 +2138,26 @@ def _tiles_rows(gpus_data, cpu, mem, servers, width):
     gtt = max([(s.get("gtt_used") or 0) for s in gpus_data], default=0)
     multi = len(servers) > 1
 
-    def speed(label, key, cur, dec):
+    def speed(label, key, cur, last, dec):
         mn, mean, mx = _extremes(key)
+        live = cur is not None
+        val = _n(cur, dec) if live else _n(last, dec)
+        # the "last" marker rides on the UNIT, not on the note: the note is 26 cells wide
+        # and min·avg·max already fills it, so a marker put there is the first thing
+        # trimmed off — and a past reading that loses its marker is a past reading being
+        # read as the current one, which is the defect this whole pass is about
+        unit = "t/s last" if (not live and last is not None) else "t/s"
         if mn is None:
-            return (label, f"{cur:.{dec}f}", "t/s", "measuring…")
-        return (label, f"{cur:.{dec}f}", "t/s",
+            return (label, val, unit, "" if live or last is not None else "no measurement yet")
+        return (label, val, unit,
                 f"min·avg·max {mn:.{dec}f}·{mean:.{dec}f}·{mx:.{dec}f}")
 
     tiles = []
     for d in servers:
         port = d["port"]
         sfx = f" :{port}" if multi else ""
-        tiles.append(speed("PREFILL" + sfx, f"pp_gen@{port}", d.get("pp", 0), 0))
-        tiles.append(speed("GEN" + sfx, f"tg_gen@{port}", d.get("tg", 0), 1))
+        tiles.append(speed("PREFILL" + sfx, f"pp_gen@{port}", d.get("pp"), d.get("pp_last"), 0))
+        tiles.append(speed("GEN" + sfx, f"tg_gen@{port}", d.get("tg"), d.get("tg_last"), 1))
     if free is not None:
         tiles.append((f"VRAM FREE·{which}", f"{free}", "MiB", "tighter card"))
     _pmn, _pav, ppk = _extremes("power_series")   # recorded in _collect, always current
@@ -1766,28 +2182,68 @@ def _tiles_rows(gpus_data, cpu, mem, servers, width):
 _SPARK = "·▁▂▃▄▅▆▇█"
 
 
+def _nice_step(x):
+    """The 1-2-5 step ladder every plotting axis uses. Snapping the ends of a scale to a
+    round step is what stops it from twitching: without it the low and high move a little
+    on EVERY tick, and a mapping that shifts every tick is a graph that flickers instead of
+    scrolling."""
+    if not (isinstance(x, (int, float)) and math.isfinite(x)) or x <= 0:
+        return 1.0
+    e = math.floor(math.log10(x))
+    f = x / 10 ** e
+    return (1 if f <= 1 else 2 if f <= 2 else 5 if f <= 5 else 10) * 10 ** e
+
+
 def _sparkline(key, width, maxv):
-    """A sparkline of the metric's history compressed to fit `width`. While there are
-    fewer samples than columns it fills in from the right; once there are more, the whole
-    history is bucketed into the columns — each column the MAX of its bucket, so bursts
-    stay visible — so the graph is always full instead of a mostly-empty wide strip.
-    A recorded zero shows as a low dot; `maxv` fixes the top of the scale (100 for a
-    percentage), otherwise it auto-scales to the visible maximum."""
+    """A STRIP CHART of the last `width` samples: one column per tick, the newest on the
+    right, sliding left by exactly one column each time. Returns the scale it was drawn
+    against, which the caller prints.
+
+    WHY IT SLIDES INSTEAD OF RE-BUCKETING. The previous version folded the WHOLE history
+    into `width` columns, so every column stood for a bucket whose boundaries moved as the
+    history grew: the picture did not scroll, it re-quantised in place. MEASURED
+    2026-08-26 over 900 ticks, using "is this frame the previous one shifted left by one
+    column" as the definition of scrolling: the folded version satisfied it 7.9% of the
+    time and 60.8% of its frames were IDENTICAL to the one before — frozen, then a jump.
+    One column per tick satisfies it 98.7%.
+
+    WHY THE SCALE IS SNAPPED. Fitting to the window keeps the detail (a series in a narrow
+    band uses 7 of 9 glyphs instead of 3), but recomputing the exact min and max every tick
+    moves the mapping constantly. Snapping both ends to a 1-2-5 step holds the mapping
+    still until the range really changes: on the same run, 91.3% -> 98.7% scrolling with no
+    loss of detail. A slow drift of the ends was tried first and measured WORSE than doing
+    nothing (82.2%, and 56.6% on a bursty series) — a bound that creeps every tick is the
+    flicker, not the cure.
+
+    A percentage keeps its absolute 0..maxv range: 60% drawn full-height would lie about
+    the quantity. Glyphs: `·` is a true zero and nothing else; on a fitted row the bottom
+    of the range is `▁`, since a dot there reads as "nothing happened" when what happened
+    is "the lowest value in view".
+    """
     s = HIST.get(key)
     if not s or width <= 0:
-        return [(" " * max(0, width), DIM)]
-    v = list(s)
-    n = len(v)
-    if n >= width:
-        # long history: bucket into columns, each the MAX of its bucket (bursts stay)
-        v = [max(v[i * n // width:(i + 1) * n // width] or [0]) for i in range(width)]
-    elif n > 1:
-        # short history: stretch it across the full width so the graph is never a
-        # small mark floating in blank space — coarse at first, refining as data arrives
-        v = [v[i * n // width] for i in range(width)]
-    m = maxv if maxv else (max(v) or 1)
-    t = "".join(_SPARK[int(max(0, min(8, (x or 0) / m * 8)))] for x in v)
-    return [(" " * max(0, width - len(t)), DIM), (t, SER)]
+        return [(" " * max(0, width), DIM)], None, None
+    # defence in depth: record() already refuses non-finite values, but the render must
+    # not be the thing that dies if one ever arrives by another door
+    v = [x if isinstance(x, (int, float)) and math.isfinite(x) else 0
+         for x in list(s)[-width:]]
+    pad = width - len(v)                       # a young series fills in from the right
+    if maxv:                                   # absolute scale — percentages
+        lo, hi = 0.0, float(maxv)
+        t = "".join(_SPARK[int(max(0, min(8, x / hi * 8)))] for x in v)
+    else:
+        lo, hi = float(min(v)), float(max(v))
+        if hi > lo:
+            step = _nice_step((hi - lo) / 8.0)
+            lo, hi = math.floor(lo / step) * step, math.ceil(hi / step) * step
+        span = hi - lo
+        if span <= 0:                          # genuinely flat: draw it flat, do not invent
+            t = ("·" if hi == 0 else "▄") * len(v)
+        else:
+            t = "".join("·" if x == 0 else
+                        _SPARK[1 + int(max(0, min(7, round((x - lo) / span * 7))))]
+                        for x in v)
+    return [(" " * max(0, pad), DIM), (t, SER)], lo, hi
 
 
 def _trend_rows(gpus_data, cpu, llamas, width):
@@ -1820,17 +2276,57 @@ def _trend_rows(gpus_data, cpu, llamas, width):
     # the label column fits the LONGEST label (e.g. "prefill t/s :8080"), so every
     # sparkline and value lines up in one clean column no matter how many servers run
     labw = max([15] + [_wwidth(lab) + 1 for lab, *_ in series])
-    sw = max(16, width - labw - 30)
+    sw = max(16, width - labw - 38)
     rows = []
     for lab, key, mx, dec in series:
         hs = HIST.get(key)
         cur = hs[-1] if hs else 0
+        bar, lo, hi = _sparkline(key, sw, mx)
+        seg = [(f"{lab:<{labw}}", DIM)] + bar + [(f" {cur:>7.{dec}f}", 0)]
+        # PEAK IS OVER THE WHOLE SESSION, and it is back on every row. Replacing it with
+        # the bar's own range was a bad trade: on a speed series the floor is almost always
+        # zero (idle), so "0.0…35.9" is "peak 35.9" with noise in front of it, and the one
+        # number worth keeping across a long run is the highest it ever went.
         _mn, _avg, peak = _extremes(key)
-        seg = [(f"{lab:<{labw}}", DIM)] + _sparkline(key, sw, mx) + [(f" {cur:>7.{dec}f}", 0)]
         if peak is not None:
             seg += [(f"  peak {peak:.{dec}f}", DIM)]
+        # the bar shows the LAST `sw` ticks, so its floor is not the session's. Say where
+        # that floor is whenever it is not zero: without it a narrow band high above zero
+        # is drawn full-height and reads as if it had started from nothing.
+        if not mx and lo:
+            seg += [(f"  base {lo:.{dec}f}", DIM)]
         rows.append(seg)
     return rows
+
+
+def _n(v, dec=0):
+    """A number, or an em dash. The whole llama panel used to print 0 for "no source
+    said anything", which is the one thing this program's own docstring forbids."""
+    return "—" if v is None else f"{v:.{dec}f}"
+
+
+def _ctx_text(d):
+    """/slots reports the per-SLOT context, the command line carries the total, and with
+    -np 2 they differ by a factor of two under the same word (measured on :7795, 6144
+    against 12288). Show both whenever they differ, so neither panel silently contradicts
+    the other."""
+    per, tot, sl = d.get("ctx"), d.get("ctx_total"), d.get("slots")
+    if not per:
+        return f"ctx {tot}" if tot else "ctx —"
+    if tot and tot != per:
+        return f"ctx {per}/slot · {tot} total" + (f" ({sl} slots)" if sl and sl > 1 else "")
+    return f"ctx {per}" + (f" ×{sl} slots" if sl and sl > 1 else "")
+
+
+def _why(d, which):
+    """Why a speed is unavailable — a dash with no reason just moves the puzzle."""
+    if d.get("stale"):
+        return "server did not answer"
+    if d.get("slots_off"):
+        return "slots endpoint off"
+    if which == "pp" and d.get("metrics_off"):
+        return "idle; needs --metrics for completed prefills"
+    return "idle"
 
 
 def _llama_rows(d, width):
@@ -1840,22 +2336,34 @@ def _llama_rows(d, width):
     ph = d.get("phase", "?")
     port = d.get("port", "")
     rows.append([(f"{'status':<{ET}}", DIM), (ph, OK if ph == "generating" else 0),
-                 (f"   ctx {d.get('ctx', 0)}", DIM),
-                 (f"   active {d.get('active', 0)}, queued {d.get('queued', 0)}", DIM)])
+                 (f"   {_ctx_text(d)}", DIM),
+                 (f"   active {_n(d.get('active'))}, queued {_n(d.get('queued'))}", DIM)]
+                + ([("   ⚠ stale", WARN)] if d.get("stale") else []))
     # prefill, generation (each live + windowed median±stddev) and the session lifetime
     # average (always available from the cumulative counters), packed onto one line
     speed = []
-    for label, cur, mkey, dec in (("prefill", d.get("pp", 0), "pp", 0),
-                                  ("gen", d.get("tg", 0), "tg", 1)):
+    # THREE distinct states, and collapsing them is what made this panel lie: a LIVE rate
+    # (the request running right now), the LAST rate (the request that just finished —
+    # true, but past, so it says so), and NOT MEASURABLE (no source exists on this build).
+    for label, cur, last, mkey, dec in (("prefill", d.get("pp"), d.get("pp_last"), "pp", 0),
+                                        ("gen", d.get("tg"), d.get("tg_last"), "tg", 1)):
         mp, dp = median_dev(f"{mkey}_gen@{port}")
-        cell = [(f"{label} ", DIM), (f"{cur:.{dec}f}", 0), (" t/s", DIM)]
+        if cur is not None:
+            cell = [(f"{label} ", DIM), (f"{cur:.{dec}f}", 0), (" t/s", DIM)]
+        elif last is not None:
+            cell = [(f"{label} ", DIM), (f"{last:.{dec}f}", DIM), (" t/s last", DIM)]
+        else:
+            cell = [(f"{label} ", DIM), ("—", DIM), (f" ({_why(d, mkey)})", DIM)]
         if mp is not None:
             cell.append((f" (med {mp:.{dec}f}±{dp:.{dec}f})", DIM))
         speed.append(cell)
     if d.get("pp_life") or d.get("tg_life"):
         speed.append([("session ", DIM),
-                      (f"{d.get('pp_life', 0):.0f}/{d.get('tg_life', 0):.1f}", 0),
+                      (f"{_n(d.get('pp_life'))}/{_n(d.get('tg_life'), 1)}", 0),
                       (" t/s avg", DIM)])
+    elif d.get("metrics_off"):
+        speed.append([("metrics off", WARN),
+                      (" — start with --metrics for reuse, queue and session averages", DIM)])
     rows += _flow(speed, inner)
     # kv fill, how deep the context has ever gone, the generation budget, prompt reuse
     if d.get("kv") is not None:
@@ -1863,8 +2371,9 @@ def _llama_rows(d, width):
         c = CRIT if kv >= 0.95 else WARN if kv >= 0.85 else OK
         bw = max(8, min(16, inner // 6))
         kv_cells = [[("kv ", DIM)] + _bar(kv, 1.0, bw, c)
-                    + [(f" {kv * 100:.1f}%  {d.get('kv_used', 0)}/{d.get('ctx', 0)} tok", 0)]]
-        ctx, seen = d.get("ctx", 0), d.get("max_tok", 0)
+                    + [(f" {kv * 100:.1f}%  {d.get('kv_used', 0)}/"
+                        f"{d.get('kv_cap') or d.get('ctx') or 0} tok", 0)]]
+        ctx, seen = d.get("ctx") or 0, d.get("max_tok") or 0
         if ctx and seen:
             q = seen / ctx
             kv_cells.append([("max seen ", DIM), (f"{seen}", WARN if q < 0.25 else 0),
@@ -1909,10 +2418,11 @@ def _llama_rows(d, width):
         rows.append([("per pos  ", DIM),
                      (" ".join(f"{v * 100:.0f}%" for v in d["spec_pos"]), 0)])
     w = d.get("power_w") or 0
-    if d.get("phase") == "generating" and d.get("tg", 0) > 0 and w > 0:
+    _tg = d.get("tg") or 0
+    if d.get("phase") == "generating" and _tg > 0 and w > 0:
         rows.append([(f"{'energy':<{ET}}", DIM),
-                     (f"{d['tg']:.1f} t/s at {w:.0f} W on its GPUs = ", DIM),
-                     (f"{d['tg'] / w * 1000:.0f} tok/kJ", OK),
+                     (f"{_tg:.1f} t/s at {w:.0f} W on its GPUs = ", DIM),
+                     (f"{_tg / w * 1000:.0f} tok/kJ", OK),
                      ("   this session (system draw is in power)", DIM)])
     return rows
 
@@ -1965,12 +2475,15 @@ def draw(w, gpus_data, cpu, mem, llamas, cfgs, procs):
         lnote = f"pid {d.get('pid', '')}" if multi else ""
         blocks.append((ltitle, _llama_rows(d, bw), lnote))
         cfg = cfgs.get(port)
-        if cfg:
+        if cfg is not None:          # {} is "no flags at all", which the panel still says
             blocks.append((f"config :{port}" if multi else "server config",
                            _llama_config_rows(cfg, bw), ""))
     if llamas:
         blocks.append(("llama processes", _llama_proc_rows(procs, bw), ""))
-    blocks.append(("trend", _trend_rows(gpus_data, cpu, llamas, bw), "recent"))
+    # the bar is a WINDOW now, not the whole session, so the note says its resolution:
+    # a reader who does not know how much time a column covers cannot read the shape
+    blocks.append(("trend", _trend_rows(gpus_data, cpu, llamas, bw),
+                   f"{_interval():g}s per column · peak is the whole session"))
     total = sum(len(r) + 2 for _, r, _ in blocks)
     body_top, body_bot = 1, h - 2
     body_h = body_bot - body_top + 1
@@ -2018,7 +2531,7 @@ def _interval():
     return _RATES[_rate[0]]
 
 
-def _collect(gpus, explicit_port=None):
+def _collect(gpus, explicit_port=None, lfeed=None):
     gpus_data = [g.sample() for g in gpus]
     for g, s in zip(gpus, gpus_data):
         s["backend_dev"] = getattr(g, "backend_dev", None)
@@ -2029,7 +2542,9 @@ def _collect(gpus, explicit_port=None):
             record(f"gpu{i}_vram", 100.0 * (s.get("vram_used") or 0) / s["vram_total"])
     cpu = cpu_sample()
     mem = mem_sample()
-    llamas = sample_llama_fleet(explicit_port)
+    # the TUI hands in a feed thread and never waits; --once/--line have no loop to
+    # protect and read directly
+    llamas = lfeed.data if lfeed is not None else sample_llama_fleet(explicit_port)
     # hardware trend series — always live, so the trend panel is never blank
     total_w, _ = system_power(gpus_data, cpu)      # single source of truth for the whole-box draw
     record("power_series", total_w)
@@ -2069,17 +2584,29 @@ def _collect(gpus, explicit_port=None):
                 HIST.pop(k, None)
             _last_pp.pop(port, None)
             _model_ports[port] = model
+        # A PREFILL IS AN EVENT, NOT A STATE, and that distinction decides whether its
+        # trend line exists at all. Generation spans many ticks, so charting the live rate
+        # draws it correctly. A prefill on a GPU is over before the second tick — measured
+        # 2026-08-25, 4001 tokens in 1.94 s — so the live slope is almost always absent and
+        # a series fed only from it stays at zero forever, peaks at zero, and is dropped by
+        # the "only chart a speed that has actually occurred" test below. The line was
+        # therefore invisible on exactly the servers fast enough to be worth watching.
+        # So: chart the live rate while one is running, and the COMPLETED rate on the tick
+        # it first lands — one spike per prefill, which is what actually happened.
+        pp_live, pp_done = d.get("pp"), d.get("pp_last")
+        fresh = pp_done if (pp_done and abs(pp_done - _last_pp.get(port, 0.0)) > 1e-6) else None
+        pp_now = pp_live if pp_live is not None else fresh
         if d.get("alive"):
+            # a series records 0 while idle — that is a true statement about the server
+            # (it is producing nothing) and it is what keeps the trend line continuous
             record(f"tg_series@{port}", d.get("tg") or 0)
-            record(f"pp_series@{port}", d.get("pp") or 0)
-        if d.get("phase") == "generating" and d.get("tg", 0) > 0:
+            record(f"pp_series@{port}", pp_now or 0)
+        # the MEDIAN window, unlike the trend, must only ever see real measurements
+        if d.get("phase") == "generating" and (d.get("tg") or 0) > 0:
             record(f"tg_gen@{port}", d["tg"])
-        # prefill speed changes only when a new prompt is processed; record each DISTINCT
-        # measurement (not every tick, which would flood the window with one held value)
-        pp = d.get("pp") or 0
-        if pp > 0 and abs(pp - _last_pp.get(port, 0.0)) > 1e-6:
-            record(f"pp_gen@{port}", pp)
-            _last_pp[port] = pp
+        if pp_now and abs(pp_now - _last_pp.get(port, 0.0)) > 1e-6:
+            record(f"pp_gen@{port}", pp_now)
+            _last_pp[port] = pp_now
     # remember every port that currently has a live server, so the trend keeps its line
     # (and its rolling history) while the server briefly restarts between runs. A port
     # gone for more than two minutes is genuinely finished and forgotten.
@@ -2114,8 +2641,10 @@ def _tui(w, gpus, feeds, port):
         OK, WARN, CRIT, SER = 0, curses.A_BOLD, curses.A_REVERSE, 0
     for f in feeds.values():
         f.start()
+    lfeed = _LlamaFeed(port)
+    lfeed.start()
     cpu_sample()
-    data = _collect(gpus, port)
+    data = _collect(gpus, port, lfeed)
     # Input and data collection are decoupled. getch half-blocks (timeout) so keys —
     # including the multi-byte arrow/PgUp/End escape sequences — are assembled and
     # answered within 100 ms; scrolling redraws IMMEDIATELY from the data already in
@@ -2159,9 +2688,10 @@ def _tui(w, gpus, feeds, port):
             dirty = True
         now = time.monotonic()
         if now - last_collect >= _interval():
-            data = _collect(gpus, port)
+            data = _collect(gpus, port, lfeed)
             last_collect = now
             dirty = True
+    lfeed.stop = True
     for f in feeds.values():
         f.stop = True
     return
@@ -2184,8 +2714,16 @@ def _text_line(gpus_data, cpu, mem, llamas, cfgs=None, procs=None):
             continue
         sp = f" spec {d['spec'] * 100:.0f}%" if d.get("spec") is not None else ""
         tag = f":{d['port']} " if multi else ""
-        parts.append(f"llama {tag}{d.get('phase')} pp {d.get('pp', 0):.0f} "
-                     f"tg {d.get('tg', 0):.1f}{sp}")
+        # a LOG line has no room for a column that says "this one is from the request
+        # that just ended" — so it says it inline. Writing the last rate bare is the same
+        # defect the panel was carrying: a past number wearing the present tense.
+        def _sp(live, last, dec):
+            if live is not None:
+                return _n(live, dec)
+            return f"{_n(last, dec)}(last)" if last is not None else "—"
+        parts.append(f"llama {tag}{d.get('phase')} "
+                     f"pp {_sp(d.get('pp'), d.get('pp_last'), 0)} "
+                     f"tg {_sp(d.get('tg'), d.get('tg_last'), 1)}{sp}")
     return time.strftime("%H:%M:%S") + " | " + " | ".join(parts)
 
 
