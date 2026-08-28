@@ -41,15 +41,41 @@ def read_int(path, default=0):
 
 _last_good = {}
 
+# How long a held reading stays believable. Holding the last good value across one bad
+# tick is the point of sane(); holding it forever is a different thing. With no age at
+# all, a single in-range reading meant that a sensor which later died kept replaying
+# that number for the rest of the run, styled exactly like a live one. A temperature
+# frozen at its last value with nothing on screen saying so is the worst way for an
+# overheat display to fail, because the number still looks reasonable.
+# Ten seconds: the feed readers further down trust their own caches for six and eight,
+# and sane() reads sysfs once per refresh, so ten consecutive refusals are not a blip.
+# A module constant rather than a literal, because it is a knob worth turning.
+_SANE_TTL = 10.0
+
 
 def sane(key, value, lo=None, hi=None):
-    """A sensor that answers is not a sensor that tells the truth. Out-of-range
-    values are dropped in favour of the last good one; if there never was one,
-    None — which the display turns into a dash, not a misleading zero."""
+    """A sensor that answers is not a sensor that tells the truth. Out-of-range values are
+    dropped in favour of the last good one; if there never was one, or the last one has
+    aged past _SANE_TTL, None, which the display turns into a dash, not a misleading
+    zero, and not a number the sensor stopped producing minutes ago."""
     if value is not None and (lo is None or value >= lo) and (hi is None or value <= hi):
-        _last_good[key] = value
+        _last_good[key] = (value, time.monotonic())
         return value
-    return _last_good.get(key)
+    held = _last_good.get(key)
+    if held is None or time.monotonic() - held[1] > _SANE_TTL:
+        return None
+    return held[0]
+
+
+def norm_name(s):
+    """Product names for the SAME card differ only in punctuation between sources: lspci
+    gives 'TigerLake-H GT1 [UHD Graphics]' and nvtop gives that string with round brackets.
+    Comparing on a vendor substring instead ('Arc', 'DG2', 'Intel') was measured on
+    2026-08-27 to miss integrated graphics entirely, the nvtop name contains none of the
+    three, so its utilisation figure was thrown away while it sat there for the taking.
+    A vendor word is a proxy for identity; the product name IS the identity. Letters and
+    digits only, so bracket style and spacing cannot separate two names for one card."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
 def which(name):
@@ -58,10 +84,10 @@ def which(name):
 
 
 # ------------------------------------------------------------------ PCIe chain
-# The real link a card has to the rest of the system is NOT the card's own node:
+# The real link a card has to the rest of the system is not the card's own node:
 # both may sit behind a switch whose inner segment reads wider than the negotiated
 # link to the chipset. What matters is the narrowest hop between the card and the
-# root, and the root port itself — the only stable value. Re-read every tick; it
+# root, and the root port itself, the only stable value. Re-read every tick; it
 # rises under load and drops back at idle.
 _PCIE_EFF = {2.5: 0.8, 5.0: 0.8, 8.0: 128 / 130, 16.0: 128 / 130,
              32.0: 128 / 130, 64.0: 242 / 256}
@@ -111,7 +137,7 @@ def pcie_text(link):
     return t
 
 
-# ---------------------------------------------------------- PCI product naming
+# ---------------------------------------------------------- pci product naming
 _PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                   "/usr/share/pci.ids")
 _VENDOR = {"0x1002": "AMD", "0x8086": "Intel", "0x10de": "NVIDIA"}
@@ -178,7 +204,7 @@ _vulkan_map = None
 def vulkan_device_map():
     """Map each GPU's PCI address to its Vulkan device index. vulkaninfo enumerates
     devices in the same order the ggml Vulkan backend does, so index N here is the
-    'VulkanN' that appears on a llama.cpp `-dev`/`-ts` command line — which is how you
+    'VulkanN' that appears on a llama.cpp `-dev`/`-ts` command line, which is how you
     tell which physical card llama assigned to which slot. Cached; {} without vulkaninfo
     or on any other backend (CUDA/ROCm/SYCL name their devices differently)."""
     global _vulkan_map
@@ -234,23 +260,43 @@ def _amd_gpu_metrics(card):
         return {}
     fmt_rev, content_rev = d[2], d[3]      # header: [size_lo, size_hi, format, content]
     out = {"metrics_version": f"{fmt_rev}.{content_rev}"}
-    # v1.x (Navi2x/RDNA2) layout — the fields we use sit at stable offsets.
+    # v1.x (Navi2x/RDNA2) layout, the fields we use sit at stable offsets.
     if fmt_rev == 1 and len(d) >= 120:
         u16 = lambda o: struct.unpack_from("<H", d, o)[0]
         u32 = lambda o: struct.unpack_from("<I", d, o)[0]
         u64 = lambda o: struct.unpack_from("<Q", d, o)[0]
         good = lambda x: None if x in (0xFFFF, 0) else x
+        # Clocks, validated against a Radeon RX 6750 XT (Navi 22, content_rev 3): read at
+        # the same moment as pp_dpm_sclk and pp_dpm_mclk across three different loads, the
+        # pairs matched exactly (2490/1124, 2245/675, 500/96). These are the current
+        # clocks; the averages live at other offsets and rightly do not agree.
         out["mem_clock"] = good(u16(58))
         out["gfx_clock"] = good(u16(54))
-        out["vr_gfx_mv"] = good(u16(10))          # gfx VRM voltage
-        out["vr_soc_mv"] = good(u16(12))          # soc VRM voltage
-        media = u16(20)                           # media engine activity — 0 is valid
+        # Offsets 10 and 12 are temperatures, not voltages. In gpu_metrics_v1_3 they are
+        # temperature_vrgfx and temperature_vrsoc, in degrees Celsius, and printing them
+        # as millivolts is the kind of mislabel that survives because the numbers look
+        # plausible. On a Navi 22 card they held steady at 47 and 45 while hwmon's
+        # in0_input swung between 806 and 1043 mV with the clocks: a voltage that does not
+        # follow the clocks is not a voltage, and 47 beside an edge temperature of 50 is
+        # not a coincidence. The real core voltage comes from hwmon in0_input, which this
+        # file already reads. The blob's own voltage fields at 102, 104 and 106 read
+        # 0xffff on that card, meaning unsupported.
+        out["vrm_temp_gfx"] = good(u16(10))
+        out["vrm_temp_soc"] = good(u16(12))
+        media = u16(20)                           # media engine activity, 0 is valid
         out["media_activity"] = None if media == 0xFFFF else media
-        bits = u64(112)                           # indep_throttle_status, 64-bit
-        if bits in (0, 0xFFFFFFFFFFFFFFFF):
-            bits = u32(68)                         # older 32-bit field as fallback
-        if bits == 0xFFFFFFFF:
-            bits = 0
+        # Throttle. Zero is a valid reading here: it means nothing is throttling, which is
+        # the normal state of a healthy card. Treating it as "field not present" sent
+        # every idle card down the fallback path, where a 32-bit field at a different
+        # offset was read as a throttle bitmask and produced an invented reason to worry.
+        # Offset 112 is structurally sound on v1_3: indep_throttle_status is the last u64
+        # and ends exactly at 120, which is the size the blob declares for itself. Only
+        # the all-ones sentinel means "not supported" and earns the older field.
+        bits = u64(112)
+        if bits == 0xFFFFFFFFFFFFFFFF:
+            bits = u32(68)                         # older 32-bit field, pre-v1_3 layouts
+            if bits == 0xFFFFFFFF:
+                bits = 0
         out["throttle"] = [_AMD_THROTTLE.get(i, f"bit {i}") for i in range(64) if bits >> i & 1]
     return out
 
@@ -277,7 +323,7 @@ class AmdGpu:
         self.dev = f"{card}/device"
         self.hw = _hwmon_of(card)
         self.temp_labels = _hwmon_temp_labels(self.hw)
-        # per-sensor critical/emergency thresholds declared by the driver — better
+        # per-sensor critical and emergency thresholds declared by the driver, better
         # than an invented number for colouring the temperatures
         self.temp_crit = {}
         for label, key in self.temp_labels.items():
@@ -288,14 +334,25 @@ class AmdGpu:
 
     def sample(self):
         d = {"vendor": "AMD", "name": self.name, "temp_crit": self.temp_crit}
-        mib = lambda f: read_int(f"{self.dev}/{f}") // 1048576
+        # read_int() answers 0 for a file that is not there, because that is its default,
+        # and the six readings below used to take it bare. A card whose driver does not
+        # publish gpu_busy_percent therefore reported 0 % utilisation, and one without
+        # mem_info_vram_* reported 0 MiB: not a dash, but a full empty bar drawn at zero,
+        # which is the one thing sane()'s own docstring forbids. Against a sysfs tree with
+        # those files absent the sample came back as util 0, mem_util 0, vram_total 0 and
+        # gtt_total 0, with no reason recorded anywhere. Passing None as the default is
+        # the whole fix, since read_int already accepts one.
+        def mib(f):
+            v = read_int(f"{self.dev}/{f}", None)
+            return None if v is None else v // 1048576
         d["vram_used"] = mib("mem_info_vram_used")
         d["vram_total"] = mib("mem_info_vram_total")
         d["gtt_used"] = mib("mem_info_gtt_used")
         d["gtt_total"] = mib("mem_info_gtt_total")
-        d["vram_free"] = (d["vram_total"] - d["vram_used"]) if d["vram_total"] else None
-        d["util"] = read_int(f"{self.dev}/gpu_busy_percent")
-        d["mem_util"] = read_int(f"{self.dev}/mem_busy_percent")
+        d["vram_free"] = ((d["vram_total"] - d["vram_used"])
+                          if d["vram_total"] and d["vram_used"] is not None else None)
+        d["util"] = read_int(f"{self.dev}/gpu_busy_percent", None)
+        d["mem_util"] = read_int(f"{self.dev}/mem_busy_percent", None)
 
         def dpm(f):
             for line in (read(f"{self.dev}/{f}") or "").splitlines():
@@ -320,7 +377,13 @@ class AmdGpu:
             # vddgfx has been seen at 6 mV while the card drew 8 W: below 400 it is
             # not a reading
             d["voltage"] = sane(f"{self.card}.mv", read_int(f"{self.hw}/in0_input"), 400, 1400)
-            d["fan_rpm"] = read_int(f"{self.hw}/fan1_input") or None
+            # A card in zero-fan mode reads 0 RPM, and 0 is a reading, not an absence:
+            # recent cards park their fans when cool, so this is the commonest idle state
+            # and not an edge case. `or None` reported it as "no sensor", and the panel's
+            # guard compounded it by testing truthiness, so the row disappeared entirely,
+            # a stopped fan and a card with no tachometer looked exactly alike. The same
+            # line stood in the Intel reader; both are fixed, both are covered by a test.
+            d["fan_rpm"] = read_int(f"{self.hw}/fan1_input", None)
             _pwm = read_int(f"{self.hw}/pwm1", -1)      # 0–255 duty cycle → percent
             d["fan_pct"] = round(_pwm * 100 / 255) if _pwm >= 0 else None
         d.update(_amd_gpu_metrics(self.card))
@@ -328,7 +391,43 @@ class AmdGpu:
             d["mclk"] = d["mem_clock"]
         if d.get("gfx_clock"):
             d["sclk"] = d["gfx_clock"]
+        # the VRM temperatures join the others rather than getting a line of their own: the
+        # panel already iterates `temp` and colours each against its driver-declared limits.
+        # hwmon declares no limit for these two, so they fall back to the fixed 80/90 °C,
+        # which is the same treatment any unlabelled sensor gets, not a special case.
+        for _k, _lbl in (("vrm_temp_gfx", "vrm gfx"), ("vrm_temp_soc", "vrm soc")):
+            if d.get(_k) is not None:
+                d.setdefault("temp", {})[_lbl] = d[_k]
         d["pcie"] = pcie_chain(self.dev)
+        # Why a field is empty. On AMD the answers are of a different kind than on
+        # the other two vendors, which is why the wording is not shared with them. Intel
+        # and NVIDIA are usually missing a program, so their reasons name a binary
+        # (intel_gpu_top, nvtop, nvidia-smi) and installing it clears the dash. AMD reads
+        # almost everything straight from sysfs, so the honest answer is about the driver
+        # and the card: an attribute this kernel module does not publish, a card with no
+        # hwmon node, a hwmon node missing one of its optional entries. Telling an AMD
+        # user to install something would send them after a package that changes nothing.
+        # The five keys are the closed set _gpu_rows iterates; a sixth would be written
+        # here and never rendered.
+        needs = {}
+        if d.get("util") is None:
+            needs["util"] = "gpu_busy_percent not exposed by this driver"
+        if d.get("vram_total") is None:
+            needs["vram"] = "mem_info_vram_* not exposed by this driver"
+        if all(d.get(k) is None for k in ("sclk", "mclk", "fclk", "socclk")):
+            needs["clocks"] = "no pp_dpm_* table and no clocks in gpu_metrics"
+        if not self.hw:
+            needs["temp"] = needs["power"] = "no hwmon node on this card"
+        else:
+            # Having the node is not having its files. hwmon exposes an optional set,
+            # and partial hardware is the shape that slips through a check written for
+            # missing hardware: an Arc A770 reports temperature but no energy counter.
+            if d.get("power") is None:
+                needs["power"] = "no power1_average on this hwmon node"
+            if not d.get("temp"):
+                needs["temp"] = "no temperature input on this hwmon node"
+        if needs:
+            d["needs"] = needs
         return d
 
 
@@ -344,9 +443,12 @@ class _IntelEngineFeed(threading.Thread):
         self.card_index = card_index
         self.data = {"engines": {}, "freq": 0, "alive": False, "ts": 0.0}
         self.stop = False
+        # recorded at construction so a panel can say which program is missing instead of
+        # printing a bare dash. `which` is cheap and the answer cannot change mid-run.
+        self.tool_ok = which("intel_gpu_top")
 
     def run(self):
-        if not which("intel_gpu_top"):
+        if not self.tool_ok:
             return
         while not self.stop:
             try:
@@ -362,7 +464,7 @@ class _IntelEngineFeed(threading.Thread):
                     if self.stop:
                         break
                     # engine names in the header. Modern intel_gpu_top prints them bare
-                    # ("RCS BCS VCS VECS CCS"); older builds used an "RCS/0" suffix — accept both.
+                    # ("RCS BCS VCS VECS CCS"); older builds used an "RCS/0" suffix; accept both.
                     t = re.findall(r"\b(RCS|BCS|VCS|VECS|CCS)(?:/\d+)?\b", line)
                     if t:
                         names = t
@@ -397,10 +499,17 @@ class _NvtopVramFeed(threading.Thread):
         super().__init__(daemon=True)
         self.by_key = {}      # device_name substring -> (used_mib, total_mib, ts)
         self.stop = False
+        # recorded at construction so a panel can say which program is missing instead of
+        # printing a bare dash. `which` is cheap and the answer cannot change mid-run.
+        self.tool_ok = which("nvtop")
+        # `nvtop -s` takes seconds to answer the first time, and during that window an empty
+        # by_key is not the same fact as "nvtop does not report this card": saying the
+        # second while the first is true prints something false for the first few ticks.
+        self.answered = False
 
     def run(self):
         import json
-        if not which("nvtop"):
+        if not self.tool_ok:
             return
         while not self.stop:
             try:
@@ -419,6 +528,7 @@ class _NvtopVramFeed(threading.Thread):
                     self.by_key[nm] = (
                         int(mu) // 1048576 if mu else None,
                         int(mt) // 1048576 if mt else 0, time.monotonic(), util)
+                self.answered = True
             except Exception:
                 pass
             time.sleep(2.0)
@@ -443,12 +553,30 @@ class IntelGpu:
             return None
         j = read_int(f"{self.hw}/energy1_input", -1)
         if j < 0:
+            # A counter that stops answering is not a steady load. This returned the last
+            # computed wattage with no age check, so a card whose energy attribute became
+            # unreadable displayed a frozen number for the rest of the session, styled
+            # exactly like a live one. `t` is already the timestamp of the last good
+            # counter read, so the age was available all along and simply not consulted,
+            # the same defect sane() carried, in the same file, on a different cache.
+            if time.monotonic() - self._energy["t"] > _SANE_TTL:
+                return None
             return self._energy["w"]
         t = time.monotonic()
         if self._energy["j"] and t > self._energy["t"]:
             dt = t - self._energy["t"]
             if dt > 0.4:
-                self._energy["w"] = max(0.0, (j - self._energy["j"]) / dt / 1e6)
+                dj = j - self._energy["j"]
+                # A counter that went backwards has wrapped, and clamping the negative
+                # delta to zero printed that as "0 W": a fabricated reading, and on screen
+                # no different from a card drawing nothing. The CPU path can correct the
+                # same event by adding max_energy_range_uj back, because intel-rapl
+                # publishes that range. hwmon declares no equivalent for energy1_input, so
+                # the wrap cannot be undone here. Keeping the last good figure and
+                # re-baselining costs one stale tick instead of one false one, and the
+                # tick after it reads correctly again.
+                if dj >= 0:
+                    self._energy["w"] = dj / dt / 1e6
                 self._energy["t"], self._energy["j"] = t, j
         else:
             self._energy["t"], self._energy["j"] = t, j
@@ -464,8 +592,25 @@ class IntelGpu:
             d["engines"] = eng
             d["sclk"] = ef.get("freq") or None
         if self.gt:
-            d.setdefault("sclk", sane(f"{self.card}.f",
-                                      read_int(f"{self.gt}/rps_act_freq_mhz"), 1, 4000) or None)
+            # Not setdefault. The line above inserts "sclk" whenever the engine feed is
+            # alive, whatever its frequency column held, None and 0 included, and
+            # setdefault only fills a key that is absent, never one that is merely falsy.
+            # From that point it was a guaranteed no-op and the sysfs reading below was
+            # computed and discarded: with a card holding a good 1350 in sysfs and a feed
+            # reporting 0, the sample came out with no clock at all. A key being present
+            # is not the same fact as a key having a value.
+            if d.get("sclk") is None:
+                # rps_act_freq_mhz is the actual frequency, and an idle i915 is power
+                # gated at 0: ten reads in three seconds return zero while the panel is
+                # polling, and the setpoint files beside it read 350, 600 and 1450 because
+                # they describe other things. Four layers used to agree in hiding that
+                # reading. A floor of 1 refused it, a trailing `or None` would have killed
+                # it even if the floor had let it through, read_int with no default hands
+                # back 0 for a file that is not there, and the panel guarded the row on
+                # truthiness. The default matters most: without it, absent and gated
+                # collapse into the same value, so the floor could not simply be lowered.
+                d["sclk"] = sane(f"{self.card}.f",
+                                 read_int(f"{self.gt}/rps_act_freq_mhz", None), 0, 4000)
             d["freq_min"] = read_int(f"{self.gt}/rps_RPn_freq_mhz") or None
             d["freq_eff"] = read_int(f"{self.gt}/rps_RP1_freq_mhz") or None
             d["freq_max"] = read_int(f"{self.gt}/rps_RP0_freq_mhz") or None
@@ -482,7 +627,13 @@ class IntelGpu:
             d["temp_main"] = sane(f"{self.card}.t",
                                   read_int(f"{self.hw}/temp1_input") // 1000, 1, 130)
             d["temp"] = {"gpu": d["temp_main"]} if d["temp_main"] is not None else {}
-            d["fan_rpm"] = read_int(f"{self.hw}/fan1_input") or None
+            # A card in zero-fan mode reads 0 RPM, and 0 is a reading, not an absence:
+            # recent cards park their fans when cool, so this is the commonest idle state
+            # and not an edge case. `or None` reported it as "no sensor", and the panel's
+            # guard compounded it by testing truthiness, so the row disappeared entirely,
+            # a stopped fan and a card with no tachometer looked exactly alike. The same
+            # line stood in the Intel reader; both are fixed, both are covered by a test.
+            d["fan_rpm"] = read_int(f"{self.hw}/fan1_input", None)
             _pwm = read_int(f"{self.hw}/pwm1", -1)      # 0–255 duty cycle → percent
             d["fan_pct"] = round(_pwm * 100 / 255) if _pwm >= 0 else None
             d["power"] = self._power()
@@ -490,13 +641,84 @@ class IntelGpu:
         d["pcie"] = pcie_chain(self.dev)
         # VRAM from nvtop if available
         if self.vram_feed:
-            for nm, val in self.vram_feed.by_key.items():
-                used, total, ts, nvutil = val
-                if ("Arc" in nm or "DG2" in nm or "Intel" in nm) and time.monotonic() - ts < 8:
-                    d["vram_used"], d["vram_total"] = used, total
+            mine = norm_name(self.name)
+            rows = list(self.vram_feed.by_key.items())
+            # identity first; the old vendor-substring test is kept as a fallback for a
+            # card whose two sources genuinely disagree on the name (a discrete Arc reads
+            # 'DG2 [Arc A770]' from lspci and 'Intel Arc A770 Graphics' from nvtop)
+            hit = next((v for nm, v in rows if norm_name(nm) == mine), None)
+            if hit is None:
+                hit = next((v for nm, v in rows
+                            if "Arc" in nm or "DG2" in nm or "Intel" in nm), None)
+            if hit is not None:
+                used, total, ts, nvutil = hit
+                if time.monotonic() - ts < 8:
+                    # An integrated GPU has no memory of its own, and the test for that is
+                    # the total, not the used figure. An earlier version of this guard
+                    # rested on the idea that nvtop reports no used figure for integrated
+                    # graphics, which turns out to be false at least some of the time: on a
+                    # TigerLake-H iGPU it answers with a real used figure alongside a total
+                    # of 33412202496 bytes, which is 31864 MiB and exactly what
+                    # /proc/meminfo reports as MemTotal. The guard therefore never fired,
+                    # the pair was taken, and the panel drew a half-full VRAM bar whose
+                    # denominator was the machine's RAM. The numerator matched nothing in
+                    # /proc/meminfo either, so it was a number under a label that did not
+                    # describe it.
+                    # Comparing the totals is a measurement rather than a guess at the
+                    # card's nature: a discrete Arc reports its own 16 GiB against the
+                    # machine's RAM total and keeps its bar.
+                    if total and total == RAM_TOTAL_MIB:
+                        d["vram_shared"] = True
+                    elif used is not None and total:
+                        d["vram_used"], d["vram_total"] = used, total
+                    elif total:
+                        # the older signature: a total with no used figure at all
+                        d["vram_shared"] = True
                     if d.get("util") is None and nvutil is not None:
                         d["util"] = nvutil       # fallback when intel_gpu_top can't read the PMU
-                    break
+        # Why a field is empty. On Intel the answer differs per field because the sources
+        # do: engine load comes from intel_gpu_top with nvtop as a fallback, VRAM only from
+        # nvtop, and temperature and power from the card's own hwmon node, which an
+        # integrated GPU may simply not have. The reason names the binary and never the
+        # package, since the same tools ship as intel-gpu-tools on some distributions and
+        # igt-gpu-tools on others while the binary name stays put.
+        needs = {}
+        _eng = self.engine_feed
+        if d.get("util") is None:
+            if _eng is not None and not _eng.tool_ok:
+                needs["util"] = ("needs intel_gpu_top or nvtop"
+                                 if (self.vram_feed and not self.vram_feed.tool_ok)
+                                 else "needs intel_gpu_top")
+            elif self.vram_feed is not None and self.vram_feed.tool_ok and not self.vram_feed.answered:
+                needs["util"] = "waiting for nvtop"
+            else:
+                needs["util"] = "no engine data from intel_gpu_top"
+        if not d.get("vram_total"):
+            if d.get("vram_shared"):
+                needs["vram"] = "memory is shared with system RAM"
+            elif self.vram_feed is not None and not self.vram_feed.tool_ok:
+                needs["vram"] = "needs nvtop"
+            elif self.vram_feed is not None and not self.vram_feed.answered:
+                needs["vram"] = "waiting for nvtop"
+            else:
+                needs["vram"] = "not reported by nvtop for this card"
+        if not self.hw:
+            needs["temp"] = needs["power"] = "no hwmon node on this card"
+        else:
+            # Having the node is not having its files. hwmon is a directory of optional
+            # entries, and the check above only covered the case where the whole node is
+            # absent. On an Arc A770 the temperature reads fine, so the node is plainly
+            # there, while power stays empty because that card exposes no energy1_input
+            # for the derivative to work on. A field left empty for an unexplained reason
+            # is exactly what this mechanism exists to prevent, and it survived here in
+            # the shape the check did not cover: partial hardware rather than missing
+            # hardware.
+            if d.get("power") is None:
+                needs["power"] = "no energy counter (energy1_input) on this card"
+            if not d.get("temp"):
+                needs["temp"] = "no temperature input on this hwmon node"
+        if needs:
+            d["needs"] = needs
         return d
 
 
@@ -506,6 +728,16 @@ class IntelGpu:
 _NVSMI_FIELDS = ("index", "name", "utilization.gpu", "utilization.memory",
                  "memory.used", "memory.total", "temperature.gpu", "power.draw",
                  "power.limit", "clocks.sm", "clocks.mem")
+
+# Per-process memory, which fdinfo does not carry on NVIDIA. The DRM readers below look
+# for drm-memory-vram / drm-memory-gtt, which amdgpu and i915 export and the NVIDIA driver
+# does not, so every CUDA process reads as a dash. Across three CUDA servers there were 21
+# open file descriptors to the nvidia device and no fdinfo file carrying the counter, while
+# nvidia-smi reported real figures for the same pids. nvidia-smi already runs once a second
+# here for the card-level stats, so this costs one more query on a thread that is already
+# awake. Keyed by pid string, which is what walking /proc gives, and stamped, because a
+# value from a process that has since exited is not a current value.
+_NV_PROC_MEM = {}
 
 
 class _LlamaFeed(threading.Thread):
@@ -540,9 +772,12 @@ class _NvidiaFeed(threading.Thread):
         super().__init__(daemon=True)
         self.by_index = {}
         self.stop = False
+        # recorded at construction so a panel can say which program is missing instead of
+        # printing a bare dash. `which` is cheap and the answer cannot change mid-run.
+        self.tool_ok = which("nvidia-smi")
 
     def run(self):
-        if not which("nvidia-smi"):
+        if not self.tool_ok:
             return
         query = "--query-gpu=" + ",".join(_NVSMI_FIELDS)
         while not self.stop:
@@ -566,6 +801,29 @@ class _NvidiaFeed(threading.Thread):
                         "sclk": num(c[9]), "mclk": num(c[10]), "ts": time.monotonic()}
             except Exception:
                 pass
+            # second query: memory per compute process. Separate from the one above because
+            # it is a different table with a different key (pid, not card index), and folding
+            # them would make one failing take the other down with it.
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5).stdout
+                now = time.monotonic()
+                for line in out.strip().splitlines():
+                    c = [x.strip() for x in line.split(",")]
+                    if len(c) < 2:
+                        continue
+                    try:
+                        _NV_PROC_MEM[c[0]] = (int(float(c[1])), now)
+                    except ValueError:
+                        continue
+                # drop entries for processes that have exited, or the dict grows for the
+                # whole run. The panel already ignores them by age; this only bounds memory
+                for pid in [k for k, (_m, t) in _NV_PROC_MEM.items() if now - t > 60]:
+                    _NV_PROC_MEM.pop(pid, None)
+            except Exception:
+                pass
             time.sleep(1.0)
 
 
@@ -585,6 +843,13 @@ class NvidiaGpu:
                       ("util", "mem_util", "vram_used", "vram_total", "temp_main",
                        "power", "power_cap", "sclk", "mclk")})
             d["temp"] = {"gpu": d.get("temp_main")} if d.get("temp_main") is not None else {}
+        else:
+            # NVIDIA exposes none of this in sysfs, so nvidia-smi is the only source there
+            # is and its absence takes out every field at once. Saying so beats five dashes
+            # that each leave the reader to guess whether the card is idle or unread.
+            why = ("needs nvidia-smi" if not self.feed.tool_ok
+                   else "nvidia-smi returned nothing for this card")
+            d["needs"] = {f: why for f in ("util", "vram", "temp", "power", "clocks")}
         return d
 
 
@@ -725,7 +990,11 @@ def cpu_sample():
                     _CPU_E["t"], _CPU_E["j"] = t, j
             else:
                 _CPU_E["t"], _CPU_E["j"] = t, j
-        d["power"] = _CPU_E["w"]
+        # unconditional until now: the line ran whether or not the counter had been read
+        # this tick, so an unreadable RAPL node froze the CPU wattage forever. Same age
+        # check as the GPU path above and as sane(), from the timestamp already kept here.
+        d["power"] = (_CPU_E["w"]
+                      if time.monotonic() - _CPU_E["t"] <= _SANE_TTL else None)
     return d
 
 
@@ -743,7 +1012,7 @@ def mem_sample():
          "cached": m.get("Cached", 0), "buffers": m.get("Buffers", 0),
          "committed": m.get("Committed_AS", 0), "dirty": m.get("Dirty", 0),
          "shmem": m.get("Shmem", 0)}
-    # swap split by destination: zram stays compressed IN ram, a swapfile leaves it
+    # swap split by destination: zram stays compressed in RAM, a swapfile leaves it
     zram_used = zram_total = disk_used = disk_total = 0
     for r in (read("/proc/swaps", "") or "").splitlines()[1:]:
         c = r.split()
@@ -771,6 +1040,16 @@ def mem_sample():
     return d
 
 
+# MemTotal does not change for the life of a boot, so it is read once, and it is read
+# through mem_sample() rather than through a second parser of /proc/meminfo, a second
+# parser is a second place the same number can drift. It exists because it is the only
+# honest way to tell an integrated GPU from a discrete one: not the vendor (Arc is Intel
+# and discrete), not the name, but the measurable fact that the "VRAM total" a helper
+# reports for the card is the machine's RAM. A 0 here means unreadable, and 0 never
+# equals a real total, so the comparison simply never fires.
+RAM_TOTAL_MIB = mem_sample().get("total") or 0
+
+
 # ----------------------------------------------------- llama.cpp server probe
 def _port_of(cmd):
     """The --port a llama-server was started with (default 8080)."""
@@ -789,7 +1068,7 @@ def _host_of(cmd):
 
 
 def discover_llama_servers():
-    """Every running llama-server, keyed by the port it listens on — read from the
+    """Every running llama-server, keyed by the port it listens on, read from the
     process list, so a server is found on ANY port and ALL of them are found when
     several run at once, with nothing to configure."""
     out, seen = [], set()
@@ -815,7 +1094,7 @@ def discover_llama_servers():
 
 
 def llama_spec_from_cmdline(port=None):
-    """Which speculative head a server uses, read from its command line — no endpoint
+    """Which speculative head a server uses, read from its command line, no endpoint
     reports it. -md absent with an mtp type means the head is native. With `port`
     given, only the server on that port is inspected."""
     for p in glob.glob("/proc/[0-9]*"):
@@ -837,7 +1116,16 @@ def llama_spec_from_cmdline(port=None):
                     break
                 except IndexError:
                     pass
-        for flag in ("--spec-draft-n-max", "-n-max"):
+        # Same aliases as the config panel, and they used to differ. This list carried
+        # `-n-max`, which is not a llama.cpp flag at all: dead code holding the place of
+        # the real ones, while the panel's `speculative` group knew `--draft-max` and
+        # `--draft`. Two readers of one flag with two lists is a divergence that ages
+        # badly: the panel would show the value and this line would not. Checked against
+        # llama.cpp's own arg.cpp: `--spec-draft-n-max` is the live flag, and
+        # `--draft` / `--draft-n` / `--draft-max` were removed upstream (they now abort
+        # with "use --spec-draft-n-max"). The removed ones are kept on purpose, because a
+        # server running an older build still carries them on its command line.
+        for flag in ("--spec-draft-n-max", "--draft-max", "--draft-n", "--draft"):
             if flag in cmd:
                 try:
                     nmax = cmd[cmd.index(flag) + 1]
@@ -852,7 +1140,7 @@ def llama_ctx_from_cmdline(port=None):
     """The context a server was ALLOCATED, read from its -c. The authoritative source for
     the total, and the reason it is not derived instead: multiplying the per-slot context
     from /slots by total_slots is right on one build and wrong on another. MEASURED
-    2026-08-25 across the four servers here — :7795 (-c 12288 -np 2) reports 6144 a slot,
+    2026-08-25 across the four servers here, :7795 (-c 12288 -np 2) reports 6144 a slot,
     so per×slots recovers 12288 and agrees; :7797 (-c 4096, --reranking) reports 4096 a
     slot across FOUR slots, so the same arithmetic invents 16384 for a server that
     allocated 4096. The command line does not need the inference."""
@@ -874,7 +1162,7 @@ def llama_ctx_from_cmdline(port=None):
 
 def llama_devices_from_cmdline(port=None):
     """The GPU backend devices a server was told to run on (-dev / --device), e.g.
-    ['Vulkan0', 'Vulkan1']. An empty list means the flag was absent — which in llama.cpp
+    ['Vulkan0', 'Vulkan1']. An empty list means the flag was absent, which in llama.cpp
     means 'use every available device'. Read at runtime from the process, named after
     nothing: it just returns whatever labels the command line carries. Used to charge a
     server's energy line to the cards IT actually uses, not the whole box."""
@@ -894,15 +1182,15 @@ def llama_devices_from_cmdline(port=None):
     return []
 
 
-# Every flag llama-server accepts, grouped for reading. This list is the ORDER and the
-# LABELS — it is NOT the filter. Whatever it does not name still reaches the panel through
+# Every flag llama-server accepts, grouped for reading. This list is the order and the
+# labels; it is not the filter. Whatever it does not name still reaches the panel through
 # the "other" group below, computed as the complement of what these entries consumed. That
 # inversion is the whole point: the previous version showed a hardcoded subset, so a run
 # started with --dry-multiplier, --pooling, --jinja or --load-mode simply had no line
-# anywhere, and nothing said so. MEASURED 2026-08-25 on the four servers here — between 6
-# and 8 settings shown out of 15 to 18 flags actually passed. A curated list also ages
-# against llama.cpp: every flag added upstream would be invisible until someone edited
-# this file, which is the same defect one release later.
+# anywhere, and nothing said so: across four servers only six to eight settings appeared
+# out of the fifteen to eighteen flags actually passed. A curated list also ages against
+# llama.cpp, since every flag added upstream stays invisible until someone edits this
+# file, which is the same defect one release later.
 _LLAMA_FLAG_GROUPS = (
     ("loading", (
         ("model", ("-m", "--model")), ("alias", ("-a", "--alias")),
@@ -916,8 +1204,8 @@ _LLAMA_FLAG_GROUPS = (
         ("batch", ("-b", "--batch-size")), ("ubatch", ("-ub", "--ubatch-size")),
         ("slots", ("-np", "--parallel")),
         ("mmap", ("--no-mmap", "--mmap")), ("mlock", ("--mlock",)),
-        # the label of a negating switch is the CONCEPT, never the flag: "no-warmup off"
-        # says warmup is ON, which is the opposite of what --no-warmup did
+        # the label of a negating switch is the concept, never the flag: "no-warmup off"
+        # says warmup is on, which is the opposite of what --no-warmup did
         ("load-mode", ("--load-mode",)), ("warmup", ("--no-warmup", "--warmup")),
         ("numa", ("--numa",)),
         ("override-tensor", ("-ot", "--override-tensor")),
@@ -944,7 +1232,7 @@ _LLAMA_FLAG_GROUPS = (
         ("xtc", ("--xtc-probability", "--xtc-threshold")),
         ("repeat", ("--repeat-penalty",)), ("repeat-last-n", ("--repeat-last-n",)),
         ("presence", ("--presence-penalty",)), ("frequency", ("--frequency-penalty",)),
-        # DRY (Do not Repeat Yourself) — the repetition sampler that works on n-grams
+        # DRY (Do not Repeat Yourself), the repetition sampler that works on n-grams
         # instead of a flat token penalty. Five separate flags, none of which had a line.
         ("dry-multiplier", ("--dry-multiplier",)), ("dry-base", ("--dry-base",)),
         ("dry-allowed-length", ("--dry-allowed-length",)),
@@ -971,11 +1259,13 @@ _LLAMA_FLAG_GROUPS = (
     ("speculative", (
         ("type", ("--spec-type",)),
         ("head", ("-md", "--model-draft", "--spec-draft-model")),
-        ("n-max", ("--spec-draft-n-max", "--draft-max", "--draft")),
+        # --draft/--draft-n/--draft-max were removed upstream in favour of the first;
+        # kept for older builds, and deliberately identical to llama_spec_from_cmdline
+        ("n-max", ("--spec-draft-n-max", "--draft-max", "--draft-n", "--draft")),
         ("n-min", ("--spec-draft-n-min", "--draft-min")),
         # p-min is the adaptive cut-off: the draft stops proposing once its own
         # confidence drops below it (default 0.00 = never cut). One of the biggest,
-        # most-tuned knobs — it reshapes the acceptance curve.
+        # most-tuned knobs: it reshapes the acceptance curve.
         ("p-min", ("--spec-draft-p-min", "--draft-p-min")),
         ("p-split", ("--spec-draft-p-split", "--draft-p-split")),
         ("draft-dev", ("-devd", "--device-draft")),
@@ -1043,7 +1333,7 @@ def llama_settings_from_cmdline(port=None):
     NOTE ON THE SAMPLING GROUP, because the word is narrower than it looks: what is here is
     the server's DEFAULT, applied only when a request does not carry its own. A client that
     sends temperature or repeat_penalty in the request body overrides it, and the panel
-    cannot see that from /proc — the live values are in the slot, not the command line."""
+    cannot see that from /proc, the live values are in the slot, not the command line."""
     for p in glob.glob("/proc/[0-9]*"):
         if (read(f"{p}/comm", "") or "") != "llama-server":
             continue
@@ -1056,7 +1346,7 @@ def llama_settings_from_cmdline(port=None):
 
 def settings_from_cmd(cmd):
     """The grouping itself, split out from the /proc walk so it can be exercised on a
-    command line that no process is running — including flags this build has never seen."""
+    command line that no process is running, including flags this build has never seen."""
     pairs = _parse_cmdline_flags(cmd)
     base = lambda v: os.path.basename(v).replace(".gguf", "") if isinstance(v, str) else v
     used = set()                       # indices of pairs a themed entry claimed
@@ -1075,7 +1365,7 @@ def settings_from_cmd(cmd):
                 if label in ("model", "head") or flag in ("--lora", "--lora-scaled",
                                                           "--control-vector"):
                     v = base(v)
-                # a negating switch says what it turns OFF, so print the flag itself
+                # a negating switch says what it turns off, so print the flag itself
                 # rather than a bare "on" that reads as the opposite
                 if v is True:
                     v = "off" if flag.startswith("--no-") else "on"
@@ -1083,7 +1373,7 @@ def settings_from_cmd(cmd):
             rows.append((label, " ".join(shown)))
         if rows:
             out[group] = rows
-    # THE COMPLEMENT, and it is what makes this list an ordering instead of a filter
+    # The complement, and it is what makes this list an ordering instead of a filter
     leftover = [(flag, val) for k, (flag, val) in enumerate(pairs) if k not in used]
     if leftover:
         out["other"] = [(flag.lstrip("-"),
@@ -1110,17 +1400,39 @@ def _capabilities(status):
     return []
 
 
+def _nv_proc_fill(v):
+    """Last resort for a process whose DRM counters were not readable: NVIDIA's own view.
+    Only tried when fdinfo gave nothing AND the process holds a descriptor on the nvidia
+    device, so it never invents a card for a CPU-only server.
+
+    THE SOURCE IS RECORDED, not blended, because the two do not answer the same question.
+    fdinfo splits device memory from the host-side GTT spill, which is the whole point of
+    this panel; nvidia-smi reports one figure for memory ON THE CARD and does not split it.
+    So `gtt` is set to None, UNKNOWN, instead of staying 0, because a 0 here reads as
+    "nothing spilled" about a thing nobody measured. That is the same defect this file
+    already fixed on prefill speed, one field along."""
+    if v["read"] or not v["gpu_accel"]:
+        return v
+    mem = _NV_PROC_MEM.get(v["pid"])
+    if mem and time.monotonic() - mem[1] < 6:
+        v["vram"], v["gtt"], v["read"], v["vram_src"] = mem[0], None, True, "nvidia-smi"
+    return v
+
+
 def llama_processes():
-    """Every llama.cpp process, with its resident memory and — read straight from
-    fdinfo — how much of it is on the card (VRAM) versus spilled into host memory
-    (GTT), which is the read-via-PCIe overflow that quietly tanks tokens/s."""
+    """Every llama.cpp process, with its resident memory and, read straight from
+    fdinfo, how much of it is on the card (VRAM) versus spilled into host memory
+    (GTT), which is the read-via-PCIe overflow that quietly tanks tokens/s. NVIDIA does
+    not export those DRM counters at all, so there is a documented fallback to nvidia-smi
+    (see _nv_proc_fill) that carries its own, narrower, meaning."""
     out = []
     for p in glob.glob("/proc/[0-9]*"):
         name = read(f"{p}/comm", "") or ""
         if not name.startswith("llama-"):
             continue
         v = {"pid": os.path.basename(p), "name": name, "rss": 0, "model": "",
-             "vram": 0, "gtt": 0, "read": False, "caps": [], "error": None, "gpu_accel": False}
+             "vram": 0, "gtt": 0, "read": False, "caps": [], "error": None, "gpu_accel": False,
+             "vram_src": None}
         status = read(f"{p}/status", "") or ""
         for r in status.splitlines():
             if r.startswith("VmRSS:"):
@@ -1148,7 +1460,7 @@ def llama_processes():
         except OSError:
             v["caps"] = _capabilities(status)
             v["error"] = "oserror"
-            out.append(v)
+            out.append(_nv_proc_fill(v))
             continue
         for f in files:
             t = read(f"{p}/fdinfo/{f}", "") or ""
@@ -1169,7 +1481,7 @@ def llama_processes():
                     v["gtt"] = kb // 1024
             v["read"] = True
             break
-        out.append(v)
+        out.append(_nv_proc_fill(v))
     return sorted(out, key=lambda x: -x["rss"])
 
 
@@ -1183,16 +1495,26 @@ class LlamaProbe:
         self.host = host or "127.0.0.1"
         self.state = {"alive": False}
         self.cnt = {}
-        # None means NOT MEASURABLE and is drawn as a dash with the reason. 0.0 would be
+        # None means not measurable and is drawn as a dash with the reason. 0.0 would be
         # a claim ("this server prefills at zero tokens a second") that no source ever
-        # made — and with /metrics off, which is the default, that claim was the only
+        # made, and with /metrics off, which is the default, that claim was the only
         # thing the prefill field ever showed.
         self.tg = self.pp = None
         self.tg_last = self.pp_last = None   # rate of the last COMPLETED request
+        # Time to first token of the last completed request, in seconds, as the server
+        # timed it. It was already being computed and discarded: pp_last is prompt tokens
+        # over prompt seconds, and that denominator is the wait before the first token.
+        # Timing it here instead, by watching /slots, would carry the poll interval as its
+        # error bar (0.4 s on a 1.94 s prefill is 20%), manufacturing precision when the
+        # exact figure is already in hand, which is the defect this file fixed on prefill
+        # speed. `_ttft_slots` records how many slots were working over that interval,
+        # because with two the counters advanced for two requests and the sum is not a TTFT.
+        self.ttft_last = None
+        self._ttft_slots = 0
         # 6 s of trail at the fastest refresh (0.5 s) needs 13 slots, not 12: the old cap
         # silently shortened the window at the very rate a user picks to watch it closely.
-        self._dhist = deque(maxlen=32)       # (time, n_decoded) — generation
-        self._phist = deque(maxlen=32)       # (time, n_prompt_processed) — prefill
+        self._dhist = deque(maxlen=32)       # (time, n_decoded), generation
+        self._phist = deque(maxlen=32)       # (time, n_prompt_processed), prefill
         self._dlast = self._plast = 0
         self._busy = False
         self.ctx = self.ctx_total = self.slots = None   # server FACTS, survive a bad tick
@@ -1218,18 +1540,18 @@ class LlamaProbe:
         ZEROS. Arm the 60 s countdown and hand back the LAST GOOD state, marked stale:
         ctx, kv and model stay on screen and only the two speeds go to "not measurable".
         Rebuilding the dict from defaults here is what made the context appear to reset."""
-        # A FIXED sixty seconds was wrong in both directions at once: far too long a
-        # penalty for one slow answer, and useless against a server that will be silent
-        # for longer than that anyway. MEASURED 2026-08-25 on :8181 during a 78 s CPU
-        # prefill — /slots did not answer AT ALL (three consecutive 20 s timeouts, then
-        # 13.83 s the moment the prefill ended, zero replies under 1.2 s). No timeout
-        # value would have helped, and the 60 s blackout simply hid the whole run. So:
+        # A fixed sixty seconds was wrong in both directions at once: far too long a
+        # penalty for one slow answer, and useless against a server that will stay silent
+        # for longer than that anyway. During a 78-second prefill on CPU, /slots did not
+        # answer at all: three consecutive 20-second timeouts, then a 13.8-second reply
+        # the moment the prefill ended, and nothing under 1.2 seconds in between. No
+        # timeout value would have helped, and the blackout hid the whole run. Hence:
         # retry immediately once, then back away geometrically, and never for long.
         # capped so the ladder below never computes 2**700 on a long outage just to throw
         # it away at the min(): the wait is bounded at 5 s from the fourth failure on
         self._fails = min(getattr(self, "_fails", 0) + 1, 8)
-        # capped low ON PURPOSE: with the fan-out above, a probe that keeps failing no
-        # longer slows anything else down, so there is nothing to buy by waiting longer —
+        # capped low on purpose: with the fan-out above, a probe that keeps failing no
+        # longer slows anything else down, so there is nothing to buy by waiting longer,
         # and every second of wait is a second of missing the recovery
         self._timeout_until = time.monotonic() + (
             0 if self._fails < 2 else min(2 ** (self._fails - 1), 5))
@@ -1240,36 +1562,35 @@ class LlamaProbe:
         self.state = s
         return s
 
-    # A prefill that lasts about as long as the poll interval CANNOT be measured by
-    # polling: on :7795 a 4001-token prefill ran in 1.94 s and left two usable samples,
-    # from which the slope reads ~790 t/s against the 2065 the server timed. So the live
-    # prefill is published only once it has been running longer than this — a big prompt
-    # on CPU takes a minute and is genuinely samplable, a GPU prefill is over before the
-    # second tick. Below the threshold the completed-request figure from /metrics is used
-    # instead, and it is exact (2068 against 2065.45, measured 2026-08-25). Publishing the
-    # slope anyway would be manufacturing precision, which is the defect being fixed here
-    # wearing better clothes.
+    # A prefill that lasts about as long as the poll interval cannot be measured by
+    # polling: a 4001-token prefill running in 1.94 s leaves two usable samples, and the
+    # slope through them reads around 790 t/s against the 2065 the server timed for the
+    # same work. So the live prefill rate is published only once it has been running
+    # longer than this. A large prompt on CPU takes a minute and is genuinely samplable;
+    # a prefill on a GPU is over before the second tick. Below the threshold the
+    # completed-request figure from /metrics is used instead, and it is exact. Publishing
+    # the slope anyway would be manufacturing precision.
     _PREFILL_MIN_SPAN = 2.0
 
     @staticmethod
     def _slope(hist, cur, prev, minspan=0.6, window=6.0, anchor_zero=False):
         """Tokens per second from a (time, counter) trail, or None while the trail is
-        too short to say. Called only while the slot is BUSY — that restriction is the
+        too short to say. Called only while the slot is BUSY, that restriction is the
         fix, not a detail. Feeding it a finished request's counter, which llama.cpp
         leaves standing in the slot, makes the window slide off the end of the work: the
         numerator shrinks while the denominator stays ~6 s, so the reading decays, and
         once the window is entirely past the request the delta is 0 and the guard stops
-        updating — leaving the last decayed value frozen on screen. MEASURED 2026-08-25
+        updating, leaving the last decayed value frozen on screen. MEASURED 2026-08-25
         on :8181, whose own timings reported 29.93 t/s: 29.7, 27.8, 24.7, 21.1, 17.7,
         14.2, 12.7, 9.4, 5.4, 1.606, then 1.606 for as long as anyone watched."""
         now = time.monotonic()
         if cur < prev:                     # counter restarted: a new request began
             hist.clear()
-        # WHERE THE TRAIL STARTS is not the same question for the two rates, and using one
+        # Where the trail starts is not the same question for the two rates, and using one
         # answer for both is wrong in opposite directions. Prefill starts at zero tokens
-        # processed, so the zero IS the anchor and dropping it loses the start of the work.
-        # Generation also starts at zero decoded, but that zero sits at the END of prefill:
-        # anchoring there would divide the generated tokens by generation time PLUS prefill
+        # processed, so the zero is the anchor and dropping it loses the start of the work.
+        # Generation also starts at zero decoded, but that zero sits at the end of prefill:
+        # anchoring there would divide the generated tokens by generation time plus prefill
         # time and report a speed the model never ran at.
         if cur <= 0 and not anchor_zero:
             return None
@@ -1285,11 +1606,12 @@ class LlamaProbe:
         """The full SHAPE of a sample. Server FACTS (context, slot count, model) describe
         the SERVER and not this tick, so they are seeded from the last good sample: one
         failed request must not be able to make the panel read "ctx 0". Only the per-tick
-        MEASUREMENTS start empty. Every exit from sample() returns this shape — handing
+        MEASUREMENTS start empty. Every exit from sample() returns this shape, handing
         back a partial dict pushes the job of inventing defaults onto nine render sites,
         which is how a missing key becomes a zero on screen."""
         return {"alive": False, "phase": "off", "pp": None, "tg": None,
              "pp_last": self.pp_last, "tg_last": self.tg_last, "kv": None,
+             "ttft_last": self.ttft_last, "ttft_slots": self._ttft_slots,
              "ctx": self.ctx, "ctx_total": self.ctx_total, "slots": self.slots,
              "model": self.model, "spec": None, "tok_step": None,
              "spec_acc": 0, "spec_draft": 0, "spec_pos": [], "active": None, "queued": None,
@@ -1316,9 +1638,9 @@ class LlamaProbe:
             m = {}
             raw = self._get("/metrics")
             # A build started without --metrics answers 501 with a JSON error body. That
-            # is NOT "every counter reads zero", it is "no counter exists" — and reading
-            # it as zeros is exactly what pinned prefill, active, queued and prompt-reuse
-            # to 0 on every server here (all four, measured 2026-08-25).
+            # is not "every counter reads zero", it is "no counter exists", and reading it
+            # as zeros is what pinned prefill, active, queued and prompt reuse to 0 on
+            # every server at once.
             if raw.lstrip().startswith("{"):
                 d["alive"] = True
                 d["metrics_off"] = True
@@ -1342,10 +1664,10 @@ class LlamaProbe:
                 d["cache_hit"] = int(m.get("llamacpp:prompt_tokens_cached_total", 0))
                 d["prompt_new"] = int(m.get("llamacpp:prompt_tokens_total", 0))
                 d["max_tok"] = int(m.get("llamacpp:n_tokens_max", 0)) or None
-                # a build that does not EXPORT the cache counter is not a build with zero
-                # reuse: :8181 (ik_llama) exports 10 counters where mainline exports 15,
-                # and reading the gap as a value would print "prompt reuse 0.0%" about a
-                # thing nobody measured — the same defect as prefill, one field along
+                # a build that does not export the cache counter is not a build with zero
+                # reuse. Forks differ here: ik_llama exports ten counters where mainline
+                # exports fifteen, and reading the gap as a value would print a confident
+                # "prompt reuse 0.0%" about something nothing measured
                 _tot = d["cache_hit"] + d["prompt_new"]
                 d["reuse"] = (d["cache_hit"] / _tot) if (
                     _tot and "llamacpp:prompt_tokens_cached_total" in m) else None
@@ -1368,10 +1690,16 @@ class LlamaProbe:
                      "llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total")
                 c = {k: m.get(k, 0.0) for k in C}
                 # a finished request moves these counters; their delta is the rate of the
-                # request that just ended, which is the LAST rate, never the current one
+                # request that just ended, which is the last rate, never the current one
                 if self.cnt:
                     if c[C[0]] - self.cnt[C[0]] > 0 and c[C[1]] - self.cnt[C[1]] > 0:
-                        self.pp_last = (c[C[0]] - self.cnt[C[0]]) / (c[C[1]] - self.cnt[C[1]])
+                        _pdt = c[C[1]] - self.cnt[C[1]]
+                        self.pp_last = (c[C[0]] - self.cnt[C[0]]) / _pdt
+                        # keep the denominator too. `_bids` still holds the previous tick's
+                        # busy slots at this point (the /slots block that refreshes it runs
+                        # below), which is exactly the window these counters cover.
+                        self.ttft_last = _pdt
+                        self._ttft_slots = len(getattr(self, "_bids", ()) or ())
                     if c[C[2]] - self.cnt[C[2]] > 0 and c[C[3]] - self.cnt[C[3]] > 0:
                         self.tg_last = (c[C[2]] - self.cnt[C[2]]) / (c[C[3]] - self.cnt[C[3]])
                 self.cnt = c
@@ -1388,18 +1716,16 @@ class LlamaProbe:
             s = json.loads(self._get("/slots"))
             if not isinstance(s, list):
                 # /slots disabled (--no-slots) or an error body: there is no live phase to
-                # read. Say so — do NOT let ctx, kv and the phase fall through as zeros.
+                # read. Say so; do not let ctx, kv and the phase fall through as zeros.
                 d["slots_off"] = True
                 raise ValueError("slots endpoint unavailable")
             x = s[0] if s else {}
-            # EVERY SLOT, not slot 0. A server started with -np N hands a request to
+            # Every slot, not slot 0. A server started with -np N hands a request to
             # whichever slot is free, so reading s[0] alone makes the panel say "idle"
-            # while the server generates on another slot — and show that slot's LEFTOVER
-            # n_decoded, which is the fossil that then froze on screen. MEASURED
-            # 2026-08-25 on :8181 (-np 2): a request ran to completion on slot 1 at
-            # 29.88 t/s while slot 0 sat at state 0 holding n_decoded from an older run.
-            # Both generative servers on this box run -np 2, so about half of all work
-            # was invisible.
+            # while the server generates on another slot, and show that slot's leftover
+            # n_decoded, which then sits frozen on screen. With two slots a request can
+            # run to completion on slot 1 while slot 0 reports state 0 and holds
+            # n_decoded from an older run, which makes roughly half the work invisible.
             def _slot_busy(sl):
                 # new builds: is_processing (bool). old builds: state (int),
                 # 0=idle 1=started/prefill 2=prompt_done 3=gen
@@ -1413,7 +1739,7 @@ class LlamaProbe:
             busy_slots = [sl for sl in s if _slot_busy(sl)]
             busy = bool(busy_slots)
             # a slot that is not working carries the residue of its last request: it must
-            # count towards the KV fill (those cells ARE occupied) and never towards a rate
+            # count towards the KV fill (those cells are occupied) and never towards a rate
             dec = sum((_slot_next(sl).get("n_decoded") or sl.get("n_decoded") or 0)
                       for sl in busy_slots)
             d["decoded"] = dec
@@ -1424,9 +1750,9 @@ class LlamaProbe:
             _bdec = (_bn.get("n_decoded") or 0) if busy_slots else 0
             d["budget"] = (_bdec + resta) if isinstance(resta, int) and resta >= 0 else 0
             _nproc = sum((sl.get("n_prompt_tokens_processed") or 0) for sl in busy_slots)
-            # the number of slots actually working is a LIVE reading of the queue depth,
+            # the number of slots actually working is a live reading of the queue depth,
             # and unlike llamacpp:requests_processing it needs no --metrics
-            # DIRECT observation beats a counter here: the number of slots actually
+            # Direct observation beats a counter here: the number of slots actually
             # working is read from the slots themselves, needs no --metrics, and cannot
             # disagree with the phase drawn one line above it
             d["active"] = len(busy_slots)
@@ -1438,11 +1764,11 @@ class LlamaProbe:
                 self._dhist.clear(); self._phist.clear()
                 self._dlast = self._plast = 0
             self._bids = _ids
-            # ---- live rates, and ONLY while the slot is busy ----------------------
+            # ---- live rates, and only while the slot is busy ----------------------
             # The /metrics counters move only when a request finishes, so during a stream
             # the slot's own progress is the sole live source. When the slot goes idle
-            # llama.cpp LEAVES the counters standing, so the trail must be closed here,
-            # not left to age out: what stands after a request is the LAST rate, and it
+            # llama.cpp leaves the counters standing, so the trail must be closed here,
+            # not left to age out: what stands after a request is the last rate, and it
             # is labelled as such rather than dressed up as the current one.
             if busy:
                 r = self._slope(self._dhist, dec, self._dlast)
@@ -1469,8 +1795,8 @@ class LlamaProbe:
             if nctx:
                 self.ctx = nctx            # per-SLOT context; the total comes from /props
                 d["ctx"] = nctx
-            # New builds have n_prompt_tokens*; old builds don't — fall back to
-            # the decoded count alone (incomplete but honest). Summed over EVERY slot,
+            # New builds have n_prompt_tokens*; old builds do not, so fall back to
+            # the decoded count alone (incomplete but honest). Summed over every slot,
             # busy or not, because an idle slot still holds its conversation in the cache.
             occupied = 0
             for sl in s:
@@ -1480,7 +1806,7 @@ class LlamaProbe:
                 _sd = _slot_next(sl).get("n_decoded") or sl.get("n_decoded") or 0
                 occupied += (max(_npt, _npc) + _sd) if (_npt or _npc) else _sd
             d["kv_used"] = occupied
-            # denominator: the WHOLE allocation when several slots share it, so the sum
+            # denominator: the whole allocation when several slots share it, so the sum
             # above is compared against the capacity it was actually drawn from
             _cap = d["ctx_total"] or ((d["ctx"] or 0) * (d["slots"] or 1)) or d["ctx"]
             if _cap:
@@ -1496,10 +1822,11 @@ class LlamaProbe:
                 d["stale"] = True          # kept last-good ctx/kv rather than zeroing them
         d["pp"], d["tg"] = self.pp, self.tg
         d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
+        d["ttft_last"], d["ttft_slots"] = self.ttft_last, self._ttft_slots
         # reasoning format is in the slot data itself (both old and new builds).
-        # GUARDED, and the guard was removed once and put back: `x` is seeded to {} above,
-        # which covers "/slots failed", but NOT "/slots answered with a list whose items are
-        # not objects" — there `.get` raises and takes the whole sample down with it, so a
+        # Guarded, and the guard was removed once and put back: `x` is seeded to {} above,
+        # which covers "/slots failed", but not "/slots answered with a list whose items are
+        # not objects", there `.get` raises and takes the whole sample down with it, so a
         # server that is merely odd gets drawn as one that is not answering.
         try:
             _rf = (x.get("params", {}) or {}).get("reasoning_format") \
@@ -1515,9 +1842,9 @@ class LlamaProbe:
                 p = json.loads(self._get("/props"))
                 self.model = (os.path.basename(p.get("model_path", "")).replace(".gguf", "")
                               or p.get("model_name", ""))
-                # /slots reports the PER-SLOT context (-c divided by -np); the config panel
+                # /slots reports the per-slot context (-c divided by -np); the config panel
                 # reads -c off the command line. Both are true and they are different
-                # numbers under the same word — :7795 shows 6144 here and 12288 there.
+                # numbers under the same word, :7795 shows 6144 here and 12288 there.
                 # Carry both so the panel can say which is which instead of picking one.
                 _sl = p.get("total_slots")
                 _per = (p.get("default_generation_settings") or {}).get("n_ctx")
@@ -1546,14 +1873,27 @@ class LlamaProbe:
 def sample_llama_fleet(explicit_port=None):
     """Sample every running llama-server at once. A probe is kept per port and reused
     between ticks (so its rolling rate survives), created when a server appears and
-    dropped when it exits. `explicit_port`, if given and not already discovered, is
-    probed too. Returns one state dict per server, tagged with pid, port, and whether
-    more than one server is present (which the UI uses to reveal per-server labels)."""
+    dropped when it exits. `explicit_port` FOCUSES on one port: only that server is
+    probed and returned, and it is probed even if discovery did not find it. Returns one
+    state dict per server, tagged with pid, port, and whether more than one server is
+    present (which the UI uses to reveal per-server labels)."""
     servers = discover_llama_servers()
-    if explicit_port and not any(s["port"] == str(explicit_port) for s in servers):
-        servers.append({"pid": "?", "port": str(explicit_port),
-                        "host": "127.0.0.1", "model_hint": ""})
-        servers.sort(key=lambda s: s["port"])
+    if explicit_port:
+        # Focus means focus. This argument used to only ever append: nothing here, in
+        # _collect or in the draw loop filtered the list, so asking for one port on a
+        # machine running four still drew four panels, and an unrecognised port drew five.
+        # The help text has always claimed otherwise, and both halves of what it claims
+        # hold together, so nothing has to be traded: filter to the requested port, and if
+        # discovery missed it, probe it anyway. This function is the single point all
+        # three surfaces pass through, the panel through the feed thread, --once and
+        # --line through the collector, and --probe directly, so the filter cannot be
+        # bypassed by forgetting a caller.
+        # str().strip() because discovery yields ports as strings while a caller may hand
+        # in an integer: comparing the wrong types would match nothing and draw an empty
+        # panel, which is worse than the defect being fixed.
+        want = str(explicit_port).strip()
+        servers = [s for s in servers if s["port"] == want] or [
+            {"pid": "?", "port": want, "host": "127.0.0.1", "model_hint": ""}]
     active, todo = set(), []
     for srv in servers:
         port = srv["port"]
@@ -1562,11 +1902,11 @@ def sample_llama_fleet(explicit_port=None):
         if pr is None:
             pr = _probes[port] = LlamaProbe(port, srv["host"])
         todo.append((srv, pr))
-    # Probe every server AT ONCE. Read in a row, ONE server that has stopped answering
-    # costs every other server its own timeout — measured on this box, a silent :8181
-    # held each pass for 2.5 s, so the three healthy servers refreshed six times slower
+    # Probe every server at once. Read one after another, a single server that has
+    # stopped answering costs every other server its own timeout: one silent server
+    # holding each pass for 2.5 s made three healthy ones refresh several times slower
     # than they could. That coupling is also what forced the retry ladder to back away
-    # for 16 s at a time, which then risks missing the moment the slow one recovers.
+    # for many seconds at a time, which risks missing the moment the slow one recovers.
     # With the fan-out a failing probe costs nothing but its own thread, so the ladder
     # stays short. Probes are created above, in this thread: each one is then touched by
     # exactly one worker, and the _probes dict itself is never mutated concurrently.
@@ -1657,8 +1997,8 @@ _session = {"start": None, "t": None, "energy_j": 0.0}   # cumulative energy sin
 def record(key, value):
     """Append one sample to a series. NON-FINITE VALUES NEVER GET IN, and this is the only
     door, so no series can hold one. `float()` accepts the strings "nan" and "inf" without
-    raising, and three readers parse external tools that way — intel_gpu_top, nvtop and
-    nvidia-smi — so a sensor printing either would put it straight into the history; the
+    raising, and three readers parse external tools that way, intel_gpu_top, nvtop and
+    nvidia-smi, so a sensor printing either would put it straight into the history; the
     `num()` helper on the nvidia side only catches ValueError, which those do not raise.
     Downstream a NaN raised ValueError inside the sparkline and an inf raised OverflowError
     in the step ladder, either of which kills the whole interface. The existing `sane()`
@@ -1669,13 +2009,21 @@ def record(key, value):
     column, and holding is what the tool already does elsewhere for an out-of-range read."""
     s = HIST.setdefault(key, deque(maxlen=3600))
     if value is None or (isinstance(value, float) and not math.isfinite(value)):
-        value = s[-1] if s else 0
+        # Nothing to hold is not a zero. The fallback used to end in 0 when the series
+        # was still empty, so the first bad sample became a fabricated zero, and on a
+        # source that never answers at all every sample took that branch and the whole
+        # row charted as a measured flat line. An empty series is simply not drawn, so
+        # the row appears once there is something true to put in it. Holding behaves
+        # exactly as before the moment a real sample exists.
+        if not s:
+            return
+        value = s[-1]
     s.append(value)
 
 
 def median_dev(key, window=60):
     """Median and standard deviation of the RECENT samples (last `window`), not the
-    whole history — over thousands of samples the median is so stable it looks
+    whole history, over thousands of samples the median is so stable it looks
     frozen, and what you want on screen is generation right now."""
     import statistics
     s = HIST.get(key)
@@ -1689,7 +2037,7 @@ def median_dev(key, window=60):
 
 
 def _extremes(key):
-    """min, mean, max over the whole recorded history of a series — the spread the
+    """min, mean, max over the whole recorded history of a series, the spread the
     summary tiles and the trend peaks are drawn from. None when nothing is recorded."""
     s = HIST.get(key)
     if not s:
@@ -1722,7 +2070,7 @@ def _bar(value, total, width, attr):
 
 def _wwidth(s):
     """Display width of a string in terminal cells. Nearly every glyph here is narrow
-    — box drawing, blocks, sparklines, ·°±→… all take one cell — but the warning sign
+, box drawing, blocks, sparklines, ·°±→… all take one cell, but the warning sign
     ⚠ (U+26A0) is emoji-class and most terminals draw it two cells wide. Counting it
     as one is what lands a box border a column early. Combining marks and the emoji
     variation selector take no cell. Over-counting a hair is safe (it only opens a
@@ -1749,15 +2097,15 @@ def _wtrim(s, width):
 
 
 def _cellw(cell):
-    """Display width of a cell — a list of (text, attr) segments drawn as a unit."""
+    """Display width of a cell, a list of (text, attr) segments drawn as a unit."""
     return sum(_wwidth(t) for t, _ in cell)
 
 
 def _flow(cells, width, sep=" │ "):
     """Pack a list of cells (each a segment list) into as few rows as possible without
     any row exceeding `width` cells, greedily, keeping order. This is what lets a
-    section lay its metrics out HORIZONTALLY on a wide terminal — util, vram, temp and
-    clock share one line — and reflow onto more lines as the terminal narrows, instead
+    section lay its metrics out HORIZONTALLY on a wide terminal, util, vram, temp and
+    clock share one line, and reflow onto more lines as the terminal narrows, instead
     of one metric per line wasting the width. Cells are divided by a dim separator so a
     dense row still reads as distinct fields. Empty cells are skipped."""
     cells = [c for c in cells if c and _cellw(c) > 0]
@@ -1833,7 +2181,7 @@ def _temp_attr_th(t, thresholds):
 
 def _gtt_status(gtt, vram_free):
     """High GTT is not automatically 'model evicted from VRAM'. If the free VRAM
-    would fit the GTT, the kernel never had a reason to evict — it is host memory by
+    would fit the GTT, the kernel never had a reason to evict, it is host memory by
     choice (pinned transfer buffers, the embedding table) and -ts won't move it."""
     if gtt < 1000:
         return None
@@ -1876,7 +2224,9 @@ def _gpu_rows(s, width, idx=0):
     for label, v in temps.items():
         if v is not None:
             cells.append([(f"{label} ", DIM), (f"{v}°C", _temp_attr_th(v, crit.get(label)))])
-    if s.get("sclk"):
+    # `is not None`: a gated GPU really does sit at 0 MHz, and a truthy test hid the row
+    # entirely, the same shape as the stopped fan a few boxes further down.
+    if s.get("sclk") is not None:
         cells.append([("core ", DIM), (f"{s['sclk']} MHz", 0)])
     if s.get("mclk"):
         cells.append([("vmem ", DIM), (f"{s['mclk']} MHz", 0)])
@@ -1889,10 +2239,7 @@ def _gpu_rows(s, width, idx=0):
         cells.append([("power ", DIM), (f"{s['power']:.0f}{cap} W", 0)])
     if s.get("voltage"):
         cells.append([("vdd ", DIM), (f"{s['voltage']} mV", 0)])
-    if s.get("vr_gfx_mv") or s.get("vr_soc_mv"):
-        cells.append([("vrm ", DIM),
-                      (f"gfx {s.get('vr_gfx_mv') or '—'}/soc {s.get('vr_soc_mv') or '—'} mV", DIM)])
-    if s.get("fan_rpm"):
+    if s.get("fan_rpm") is not None:      # 0 rpm is a stopped fan, not a missing sensor
         pct = f" ({s['fan_pct']}%)" if s.get("fan_pct") is not None else ""
         cells.append([("fan ", DIM), (f"{s['fan_rpm']} rpm{pct}", 0)])
     if s.get("freq_max"):
@@ -1907,11 +2254,31 @@ def _gpu_rows(s, width, idx=0):
         rows.append([("state ", DIM), ("runtime suspended", DIM)])
     if s.get("throttle"):
         rows.append([("⚠ ", WARN), ("throttling: " + ", ".join(s["throttle"]), WARN)])
+    # Why the empty fields are empty. The README promises "a dash with a reason", and the
+    # llama.cpp side keeps that promise (see _why); the card panel did not, and worse, a
+    # field with no source did not even leave a dash, the cells are added inside `if vt:`
+    # and friends, so they vanished. A silent absence reads worse than a dash: nothing
+    # tells you whether the card is idle, a program is missing, or the tool is broken.
+    # One line, grouped by reason, not a note per cell: _flow wraps, so every extra cell
+    # costs a row on a narrow terminal, and the common case (one missing program taking out
+    # every field) collapses to a single short line. Fixed field order, not dict order, so
+    # the line does not reshuffle between ticks.
+    needs = s.get("needs") or {}
+    if needs:
+        by_reason = {}
+        for f in ("util", "vram", "temp", "power", "clocks"):
+            if f in needs:
+                by_reason.setdefault(needs[f], []).append(f)
+        cells = [[(", ".join(fs), 0), (" — ", DIM), (why, DIM)]
+                 for why, fs in by_reason.items()]
+        lab = 8
+        for i, r in enumerate(_flow(cells, inner - lab)):
+            rows.append(([(f"{'no data':<{lab}}", DIM)] if i == 0 else [(" " * lab, 0)]) + r)
     return rows
 
 
 def _cpu_rows(c, width):
-    """The CPU packed onto as few lines as the width allows — utilisation (with its
+    """The CPU packed onto as few lines as the width allows, utilisation (with its
     session average), frequency, every temperature the sensor exposes, package power
     and the load average, flowing horizontally instead of one metric per line."""
     inner = width - 4
@@ -1973,7 +2340,7 @@ def _fmt_dur(seconds):
 
 
 def system_power(gpus_data, cpu):
-    """Total watts the machine draws right now, summed from every meter it actually exposes —
+    """Total watts the machine draws right now, summed from every meter it actually exposes,
     one term per GPU the tool discovered, plus the CPU package via RAPL. Nothing about the
     hardware is named or assumed: it adds whatever discover_gpus() returned, so the same code
     is right on a one-GPU laptop and on a four-GPU server, and picks up a new card for free.
@@ -1994,7 +2361,7 @@ def system_power(gpus_data, cpu):
 def _power_rows(gpus_data, cpu, llamas, width):
     """Electrical overview laid out horizontally: each readable watt meter as a compact
     cell (the point is the whole picture, not one reading), then a prominent TOTAL with
-    its session average and peak, and — when a server is generating — the fleet's energy
+    its session average and peak, and, when a server is generating, the fleet's energy
     efficiency: how many tokens per second we get for each kilowatt drawn (t/s per kW,
     which is the same number as tokens per kJ)."""
     inner = width - 4
@@ -2034,7 +2401,7 @@ def _power_rows(gpus_data, cpu, llamas, width):
         eff = sum_tg / (total / 1000.0)                # t/s per kW  ==  tokens/kJ
         if line:
             line.append(("      ", 0))
-        # whole-system efficiency: EVERY server's tokens over the TOTAL system draw — as
+        # whole-system efficiency: Every server's tokens over the total system draw, as
         # opposed to the per-session tok/kJ shown in the llama panel. If a component's meter
         # could not be read the total is short by it, so say so instead of overstating.
         line += [("system efficiency ", DIM), (f"{eff:.0f} t/s per kW", OK),
@@ -2062,12 +2429,12 @@ def _llama_config_rows(cfg, width):
         for i, r in enumerate(_flow(cells, inner - lab)):
             prefix = [(f"{group:<{lab}}", SER)] if i == 0 else [(" " * lab, 0)]
             rows.append(prefix + r)
-        # A sampler value on the command line is what the server falls back to, NOT what
+        # A sampler value on the command line is what the server falls back to, not what
         # the model is running at: a client that puts temperature or repeat_penalty in the
-        # request body wins, and /proc cannot see that. Measured 2026-08-25 against a
-        # server whose slot went from the values one client sent to another client's the
-        # moment the second one called. True and read as false is the expensive kind of
-        # wrong, and the correction costs one dim line that only appears when it applies.
+        # request body wins, and /proc cannot see that. A slot visibly takes on one
+        # client's values and then another's the moment the second one calls. True and
+        # read as false is the expensive kind of wrong, and the correction costs one dim
+        # line that appears only when it applies.
         if group == "sampling":
             rows.append([(" " * lab, 0),
                          ("↑ server defaults — a request carrying its own overrides them",
@@ -2076,7 +2443,7 @@ def _llama_config_rows(cfg, width):
 
 
 def _llama_proc_rows(procs, width):
-    """Per-process resident memory and the VRAM/GTT split from fdinfo — non-dumpable
+    """Per-process resident memory and the VRAM/GTT split from fdinfo, non-dumpable
     binaries (file capabilities) can't be read, and it says why."""
     if not procs:
         return [[("no llama.cpp process running", DIM)]]
@@ -2097,7 +2464,13 @@ def _llama_proc_rows(procs, width):
             seg += [("   VRAM ", DIM), ("—", DIM), (f"  ({why})", DIM)]
         else:
             seg += [("   VRAM ", DIM), (f"{p['vram']}M", 0)]
-            if p["gtt"] > 200:
+            if p.get("vram_src") == "nvidia-smi":
+                # this figure came from nvidia-smi, which reports memory on the card as one
+                # number. The host-side spill this column exists for is not knowable from
+                # it, so it says so. Printing 0 would claim "nothing spilled".
+                seg += [("   GTT ", DIM), ("—", DIM),
+                        ("  (nvidia-smi does not split vram/gtt)", DIM)]
+            elif (p["gtt"] or 0) > 200:
                 seg += [("   ⚠ GTT ", CRIT), (f"{p['gtt']}M in host RAM", CRIT)]
             elif p["gtt"]:
                 seg += [("   GTT ", DIM), (f"{p['gtt']}M", DIM)]
@@ -2142,9 +2515,9 @@ def _tiles_rows(gpus_data, cpu, mem, servers, width):
         mn, mean, mx = _extremes(key)
         live = cur is not None
         val = _n(cur, dec) if live else _n(last, dec)
-        # the "last" marker rides on the UNIT, not on the note: the note is 26 cells wide
+        # the "last" marker rides on the unit, not on the note: the note is 26 cells wide
         # and min·avg·max already fills it, so a marker put there is the first thing
-        # trimmed off — and a past reading that loses its marker is a past reading being
+        # trimmed off, and a past reading that loses its marker is a past reading being
         # read as the current one, which is the defect this whole pass is about
         unit = "t/s last" if (not live and last is not None) else "t/s"
         if mn is None:
@@ -2204,7 +2577,7 @@ def _sparkline(key, width, maxv):
     history grew: the picture did not scroll, it re-quantised in place. MEASURED
     2026-08-26 over 900 ticks, using "is this frame the previous one shifted left by one
     column" as the definition of scrolling: the folded version satisfied it 7.9% of the
-    time and 60.8% of its frames were IDENTICAL to the one before — frozen, then a jump.
+    time and 60.8% of its frames were IDENTICAL to the one before, frozen, then a jump.
     One column per tick satisfies it 98.7%.
 
     WHY THE SCALE IS SNAPPED. Fitting to the window keeps the detail (a series in a narrow
@@ -2212,7 +2585,7 @@ def _sparkline(key, width, maxv):
     moves the mapping constantly. Snapping both ends to a 1-2-5 step holds the mapping
     still until the range really changes: on the same run, 91.3% -> 98.7% scrolling with no
     loss of detail. A slow drift of the ends was tried first and measured WORSE than doing
-    nothing (82.2%, and 56.6% on a bursty series) — a bound that creeps every tick is the
+    nothing (82.2%, and 56.6% on a bursty series), a bound that creeps every tick is the
     flicker, not the cure.
 
     A percentage keeps its absolute 0..maxv range: 60% drawn full-height would lie about
@@ -2228,7 +2601,7 @@ def _sparkline(key, width, maxv):
     v = [x if isinstance(x, (int, float)) and math.isfinite(x) else 0
          for x in list(s)[-width:]]
     pad = width - len(v)                       # a young series fills in from the right
-    if maxv:                                   # absolute scale — percentages
+    if maxv:                                   # absolute scale, percentages
         lo, hi = 0.0, float(maxv)
         t = "".join(_SPARK[int(max(0, min(8, x / hi * 8)))] for x in v)
     else:
@@ -2248,7 +2621,7 @@ def _sparkline(key, width, maxv):
 
 def _trend_rows(gpus_data, cpu, llamas, width):
     """Rolling recent history of the metrics that actually move, so you can see WHEN
-    something changed — not just its value now. Every series is live even between
+    something changed, not just its value now. Every series is live even between
     requests: per-GPU utilisation and VRAM fill, CPU utilisation, total power and free
     RAM, with each server's generation and prefill speed on top. Each line is the
     sparkline plus the current value and the session peak."""
@@ -2265,6 +2638,15 @@ def _trend_rows(gpus_data, cpu, llamas, width):
             series.append((f"gen t/s{sfx}", f"tg_series@{port}", None, 1))
         if pppk:
             series.append((f"prefill t/s{sfx}", f"pp_series@{port}", None, 0))
+        # charted whenever the series exists, the decision about which servers get one
+        # is made where the series is written (see _collect), not here, so there is one
+        # place that knows. Unlike the two speeds above there is no peak test: a
+        # generative server whose cache has genuinely stayed empty is a fact worth seeing,
+        # where a speed that never occurred is a flat line about nothing. Absolute 0..100
+        # scale, because it is a percentage and drawing 10% at full height would lie about
+        # the quantity.
+        if HIST.get(f"kv_series@{port}"):
+            series.append((f"kv %{sfx}", f"kv_series@{port}", 100, 1))
     for i, s in enumerate(gpus_data):
         series.append((f"{s['vendor']} util %", f"gpu{i}_util", 100, 0))
     for i, s in enumerate(gpus_data):
@@ -2273,7 +2655,7 @@ def _trend_rows(gpus_data, cpu, llamas, width):
     series.append(("cpu util %", "cpu_util", 100, 0))
     series.append(("power W", "power_series", None, 0))
     series.append(("ram free MiB", "ram_series", None, 0))
-    # the label column fits the LONGEST label (e.g. "prefill t/s :8080"), so every
+    # the label column fits the longest label (e.g. "prefill t/s :8080"), so every
     # sparkline and value lines up in one clean column no matter how many servers run
     labw = max([15] + [_wwidth(lab) + 1 for lab, *_ in series])
     sw = max(16, width - labw - 38)
@@ -2283,14 +2665,14 @@ def _trend_rows(gpus_data, cpu, llamas, width):
         cur = hs[-1] if hs else 0
         bar, lo, hi = _sparkline(key, sw, mx)
         seg = [(f"{lab:<{labw}}", DIM)] + bar + [(f" {cur:>7.{dec}f}", 0)]
-        # PEAK IS OVER THE WHOLE SESSION, and it is back on every row. Replacing it with
+        # Peak is over the whole session, and it is back on every row. Replacing it with
         # the bar's own range was a bad trade: on a speed series the floor is almost always
         # zero (idle), so "0.0…35.9" is "peak 35.9" with noise in front of it, and the one
         # number worth keeping across a long run is the highest it ever went.
         _mn, _avg, peak = _extremes(key)
         if peak is not None:
             seg += [(f"  peak {peak:.{dec}f}", DIM)]
-        # the bar shows the LAST `sw` ticks, so its floor is not the session's. Say where
+        # the bar shows the last `sw` ticks, so its floor is not the session's. Say where
         # that floor is whenever it is not zero: without it a narrow band high above zero
         # is drawn full-height and reads as if it had started from nothing.
         if not mx and lo:
@@ -2314,12 +2696,23 @@ def _ctx_text(d):
     if not per:
         return f"ctx {tot}" if tot else "ctx —"
     if tot and tot != per:
-        return f"ctx {per}/slot · {tot} total" + (f" ({sl} slots)" if sl and sl > 1 else "")
+        # Two numbers that differ do not always differ for the same reason, and calling
+        # both cases "per-slot versus total" produces nonsense: a server started with
+        # -c 350000 and a single slot read "ctx 350208/slot, 350000 total", a part larger
+        # than the whole. With several slots the split is the reason and the two multiply
+        # out. With one slot they cannot, and what is left is llama.cpp rounding the
+        # request up to its own block size: /slots reports what was allocated, the command
+        # line what was asked for.
+        # The allocated figure is the true one, so it leads, and the request is named as
+        # a request instead of masquerading as a total.
+        if sl and sl > 1 and abs(per * sl - tot) <= sl:
+            return f"ctx {per}/slot · {tot} total ({sl} slots)"
+        return f"ctx {per} allocated (asked {tot})"
     return f"ctx {per}" + (f" ×{sl} slots" if sl and sl > 1 else "")
 
 
 def _why(d, which):
-    """Why a speed is unavailable — a dash with no reason just moves the puzzle."""
+    """Why a speed is unavailable, a dash with no reason just moves the puzzle."""
     if d.get("stale"):
         return "server did not answer"
     if d.get("slots_off"):
@@ -2338,13 +2731,27 @@ def _llama_rows(d, width):
     rows.append([(f"{'status':<{ET}}", DIM), (ph, OK if ph == "generating" else 0),
                  (f"   {_ctx_text(d)}", DIM),
                  (f"   active {_n(d.get('active'))}, queued {_n(d.get('queued'))}", DIM)]
+                # The two sources disagree, and the disagreement is the information.
+                # `active` is counted from /slots by looking at which slots are working;
+                # `active_metric` is llamacpp:requests_processing from /metrics. The first
+                # is preferred because it needs no --metrics and cannot contradict the
+                # phase drawn beside it, but the second was collected and never shown, a
+                # field with no reader. requests_processing can stay at 1 after a request
+                # has already returned, because that gauge follows the slot's release and
+                # not its work. Showing the gap costs nothing when there is none, and when
+                # there is one it says the server's own counter is lagging rather than
+                # leaving two numbers to be reconciled by whoever notices.
+                + ([(f"  (metrics says {d['active_metric']})", DIM)]
+                   if (d.get("active_metric") is not None
+                       and d.get("active") is not None
+                       and d["active_metric"] != d["active"]) else [])
                 + ([("   ⚠ stale", WARN)] if d.get("stale") else []))
     # prefill, generation (each live + windowed median±stddev) and the session lifetime
     # average (always available from the cumulative counters), packed onto one line
     speed = []
-    # THREE distinct states, and collapsing them is what made this panel lie: a LIVE rate
-    # (the request running right now), the LAST rate (the request that just finished —
-    # true, but past, so it says so), and NOT MEASURABLE (no source exists on this build).
+    # Three distinct states, and collapsing them is what made this panel lie: a live rate
+    # (the request running right now), the last rate (the request that just finished,
+    # true, but past, so it says so), and not measurable (no source exists on this build).
     for label, cur, last, mkey, dec in (("prefill", d.get("pp"), d.get("pp_last"), "pp", 0),
                                         ("gen", d.get("tg"), d.get("tg_last"), "tg", 1)):
         mp, dp = median_dev(f"{mkey}_gen@{port}")
@@ -2357,6 +2764,18 @@ def _llama_rows(d, width):
         if mp is not None:
             cell.append((f" (med {mp:.{dec}f}±{dp:.{dec}f})", DIM))
         speed.append(cell)
+    # TTFT, and the label changes with the meaning rather than carrying a footnote. With a
+    # single slot the interval covers one request and the number is the wait before its
+    # first token. With two, the counters advanced for two requests and the sum is a total
+    # prefill time, not a TTFT, so it is named that instead. Two names for two things is
+    # what this file already does for per-slot versus total context.
+    if d.get("ttft_last") is not None:
+        _sl = d.get("ttft_slots") or 0
+        if _sl > 1:
+            speed.append([("prefill time ", DIM), (f"{d['ttft_last']:.2f}s", 0),
+                          (f" ({_sl} slots, summed)", DIM)])
+        else:
+            speed.append([("ttft ", DIM), (f"{d['ttft_last']:.2f}s", 0), (" last", DIM)])
     if d.get("pp_life") or d.get("tg_life"):
         speed.append([("session ", DIM),
                       (f"{_n(d.get('pp_life'))}/{_n(d.get('tg_life'), 1)}", 0),
@@ -2480,7 +2899,7 @@ def draw(w, gpus_data, cpu, mem, llamas, cfgs, procs):
                            _llama_config_rows(cfg, bw), ""))
     if llamas:
         blocks.append(("llama processes", _llama_proc_rows(procs, bw), ""))
-    # the bar is a WINDOW now, not the whole session, so the note says its resolution:
+    # the bar is a window now, not the whole session, so the note says its resolution:
     # a reader who does not know how much time a column covers cannot read the shape
     blocks.append(("trend", _trend_rows(gpus_data, cpu, llamas, bw),
                    f"{_interval():g}s per column · peak is the whole session"))
@@ -2511,7 +2930,7 @@ def draw(w, gpus_data, cpu, mem, llamas, cfgs, procs):
         pass
     # Stage the screen, then paint. stdscr holds the header, the footer and a blank
     # body; the pad holds the body. Both are staged (noutrefresh) and a single
-    # doupdate paints them together — with the pad staged LAST so it wins the body
+    # doupdate paints them together, with the pad staged last so it wins the body
     # region. Doing pad.refresh() before stdscr.refresh() (the obvious order) is the
     # trap: stdscr's erased body would then wipe the pad back out on the next update.
     w.noutrefresh()
@@ -2537,7 +2956,14 @@ def _collect(gpus, explicit_port=None, lfeed=None):
         s["backend_dev"] = getattr(g, "backend_dev", None)
         s["pci_addr"] = getattr(g, "pci_addr", None)
     for i, s in enumerate(gpus_data):
-        record(f"gpu{i}_util", s.get("util") or 0)
+        # Not `or 0`: that converted None before record() could apply its own
+        # hold-the-previous rule, so a card with no source for utilisation charted as a
+        # card measured at 0 %. With a card reporting no utilisation and a reason for it,
+        # six ticks produced six zeros and the row rendered as a flat measured idle,
+        # while the panel one box above correctly printed a dash beside the reason. The
+        # trend panel's own contract, repeated word for word in the README, is that a dot
+        # means a true zero and nothing else.
+        record(f"gpu{i}_util", s.get("util"))
         if s.get("vram_total"):
             record(f"gpu{i}_vram", 100.0 * (s.get("vram_used") or 0) / s["vram_total"])
     cpu = cpu_sample()
@@ -2545,11 +2971,12 @@ def _collect(gpus, explicit_port=None, lfeed=None):
     # the TUI hands in a feed thread and never waits; --once/--line have no loop to
     # protect and read directly
     llamas = lfeed.data if lfeed is not None else sample_llama_fleet(explicit_port)
-    # hardware trend series — always live, so the trend panel is never blank
+    # hardware trend series, always live, so the trend panel is never blank
     total_w, _ = system_power(gpus_data, cpu)      # single source of truth for the whole-box draw
     record("power_series", total_w)
     record("ram_series", mem["free"])
-    record("cpu_util", cpu.get("util") or 0)
+    # as the gpu util above: None is not a zero, and record() knows what to do
+    record("cpu_util", cpu.get("util"))
     # cumulative energy this session: integrate power over each elapsed tick (resets
     # naturally on relaunch, since these are per-process globals)
     now = time.monotonic()
@@ -2562,8 +2989,8 @@ def _collect(gpus, explicit_port=None, lfeed=None):
     cfgs = {}
     for d in llamas:
         port = d["port"]
-        # charge THIS server's energy line to the power of the GPUs it runs on (its -dev
-        # list; all cards when -dev is absent) — not the whole-box draw, which is the power
+        # charge this server's energy line to the power of the GPUs it runs on (its -dev
+        # list; all cards when -dev is absent), not the whole-box draw, which is the power
         # panel's job. So the per-session figure and the system figure are genuinely different
         # numbers: the session one omits the CPU and any card this server does not use.
         _devs = llama_devices_from_cmdline(port)
@@ -2575,8 +3002,8 @@ def _collect(gpus, explicit_port=None, lfeed=None):
         # each server's speed histories are tied to its model: reset on a swap
         model = d.get("model") or ""
         if model and model != _model_ports.get(port):
-            # reset only the MEDIAN histories, so median / min·avg·max describe the new
-            # model. The TREND sparklines (…_series) are deliberately NOT reset — they
+            # reset only the median histories, so median / min·avg·max describe the new
+            # model. The trend sparklines (…_series) are deliberately not reset, they
             # roll continuously across model swaps, which is exactly what a "recent
             # history" view wants, and is why the trend no longer blanks when the
             # campaign moves to the next model.
@@ -2584,24 +3011,49 @@ def _collect(gpus, explicit_port=None, lfeed=None):
                 HIST.pop(k, None)
             _last_pp.pop(port, None)
             _model_ports[port] = model
-        # A PREFILL IS AN EVENT, NOT A STATE, and that distinction decides whether its
+        # A prefill is an event, not a state, and that distinction decides whether its
         # trend line exists at all. Generation spans many ticks, so charting the live rate
-        # draws it correctly. A prefill on a GPU is over before the second tick — measured
-        # 2026-08-25, 4001 tokens in 1.94 s — so the live slope is almost always absent and
-        # a series fed only from it stays at zero forever, peaks at zero, and is dropped by
-        # the "only chart a speed that has actually occurred" test below. The line was
-        # therefore invisible on exactly the servers fast enough to be worth watching.
-        # So: chart the live rate while one is running, and the COMPLETED rate on the tick
-        # it first lands — one spike per prefill, which is what actually happened.
+        # draws it correctly. A prefill on a GPU is over before the second tick, four
+        # thousand tokens in under two seconds, so the live slope is almost always absent
+        # and a series fed only from it stays at zero forever, peaks at zero, and is
+        # dropped by the "only chart a speed that has actually occurred" test below. The
+        # line was therefore invisible on exactly the servers fast enough to be worth
+        # watching. So: chart the live rate while one is running, and the completed rate
+        # on the tick it first lands, giving one spike per prefill.
         pp_live, pp_done = d.get("pp"), d.get("pp_last")
         fresh = pp_done if (pp_done and abs(pp_done - _last_pp.get(port, 0.0)) > 1e-6) else None
         pp_now = pp_live if pp_live is not None else fresh
-        if d.get("alive"):
-            # a series records 0 while idle — that is a true statement about the server
+        # `and not stale` because the true statement spelled out just below, that an idle
+        # server really is producing nothing, stops being true the moment the server goes
+        # silent: the retry ladder restores the alive flag from the last good state while
+        # the rate is forced to None, so a server that answered nothing charted as a
+        # server measured at zero. A silence of over a minute during a prefill on CPU
+        # would draw a minute of generating nothing that nothing observed. Idle and mute
+        # are different facts.
+        if d.get("alive") and not d.get("stale"):
+            # a series records 0 while idle, that is a true statement about the server
             # (it is producing nothing) and it is what keeps the trend line continuous
             record(f"tg_series@{port}", d.get("tg") or 0)
             record(f"pp_series@{port}", pp_now or 0)
-        # the MEDIAN window, unlike the trend, must only ever see real measurements
+            # The KV must not copy the two lines above, and this is the whole subtlety.
+            # They record 0 while the server is idle, which is a true statement about a
+            # speed, since nothing is being produced. It is false about the cache: a slot
+            # that is not working still holds its conversation, and those cells are still
+            # taken. A server with both slots idle can still hold a couple of thousand
+            # tokens, and recording 0 there would draw a collapse at every pause that
+            # never happened. So the real value is recorded whatever the phase, and only
+            # a KV that could not be computed at all is skipped.
+            # ...and it is only charted for a generative server. An embedding or rerank
+            # server has a KV figure too, but it never moves in a way anyone reads, and
+            # this panel already made that exact call one line above ("so idle embedding /
+            # rerank servers don't fill the panel with flat-zero lines"). The role is read
+            # from the `role` group the config panel already builds, --embedding,
+            # --reranking, --pooling, so this is the same fact, not a second opinion about
+            # it. A server reached by port with no local process has no config: it is
+            # treated as generative, which is the safe way to be wrong here.
+            if d.get("kv") is not None and "role" not in (cfgs.get(port) or {}):
+                record(f"kv_series@{port}", d["kv"] * 100)
+        # the median window, unlike the trend, must only ever see real measurements
         if d.get("phase") == "generating" and (d.get("tg") or 0) > 0:
             record(f"tg_gen@{port}", d["tg"])
         if pp_now and abs(pp_now - _last_pp.get(port, 0.0)) > 1e-6:
@@ -2614,7 +3066,14 @@ def _collect(gpus, explicit_port=None, lfeed=None):
         if d.get("alive"):
             _port_seen[d["port"]] = now
     for port in [p for p, t in list(_port_seen.items()) if now - t > 120]:
-        for k in (f"pp_gen@{port}", f"tg_gen@{port}", f"pp_series@{port}", f"tg_series@{port}"):
+        # kv_series was added to the writer earlier today and not to this tuple, so a
+        # retired port left its KV history in hist for the life of the process, never read
+        # again either, since _trend_rows only looks up ports still in _port_seen. Bounded
+        # per entry by the deque, unbounded in the number of distinct ports a long session
+        # sees. The defect was mine and it is the exact shape a new field always takes:
+        # the writer is updated and the consumer that retires it is not.
+        for k in (f"pp_gen@{port}", f"tg_gen@{port}", f"pp_series@{port}",
+                  f"tg_series@{port}", f"kv_series@{port}"):
             HIST.pop(k, None)
         _port_seen.pop(port, None)
         _model_ports.pop(port, None)
@@ -2645,12 +3104,12 @@ def _tui(w, gpus, feeds, port):
     lfeed.start()
     cpu_sample()
     data = _collect(gpus, port, lfeed)
-    # Input and data collection are decoupled. getch half-blocks (timeout) so keys —
-    # including the multi-byte arrow/PgUp/End escape sequences — are assembled and
-    # answered within 100 ms; scrolling redraws IMMEDIATELY from the data already in
+    # Input and data collection are decoupled. getch half-blocks (timeout) so keys,
+    # including the multi-byte arrow/PgUp/End escape sequences, are assembled and
+    # answered within 100 ms; scrolling redraws immediately from the data already in
     # hand. A full _collect() (which includes a blocking HTTP read of the server) runs
-    # only on its own cadence, never in the keypress path — that coupling was what made
-    # scrolling stutter and the screen jump. Bare ESC no longer quits, so an arrow key
+    # only on its own cadence, never in the keypress path, that coupling was what made
+    # scrolling stutter and the screen jump. Bare esc no longer quits, so an arrow key
     # whose escape prefix arrives alone can't kill the program.
     w.timeout(100)
     last_collect = time.monotonic()
@@ -2700,22 +3159,51 @@ def _tui(w, gpus, feeds, port):
 def _text_line(gpus_data, cpu, mem, llamas, cfgs=None, procs=None):
     parts = []
     total_w, _ = system_power(gpus_data, cpu)
+    # This function used to hold two standards. The llama half below already routed every
+    # rate through _n(), which prints a dash when no source said anything, while this half
+    # printed `or 0`, so a missing reading arrived as the number zero: the one thing the
+    # program promises not to do. On a card whose hwmon exposes no energy counter, --probe
+    # read the power as absent while this line printed 0 W for the same tick.
+    # `is None` rather than truthiness, because 0 W, 0 % and an idle GPU are real
+    # readings and have to survive.
     for s in gpus_data:
-        vram = f"{s.get('vram_used') or 0}/{s.get('vram_total') or 0}" if s.get("vram_total") else "-"
-        parts.append(f"{s['vendor']} util {s.get('util') or 0:.0f}% vram {vram} "
-                     f"{s.get('temp_main') or '-'}C {s.get('power') or 0:.0f}W")
-    parts.append(f"CPU {cpu.get('util') or 0:.0f}% {cpu.get('temp') or '-'}C "
+        # The memory half of this statement kept the `or 0` idiom when utilisation and
+        # power moved onto _n() below, so a missing used figure still printed as zero over
+        # the total: a partial fix, which is worse than none because the line then looks
+        # repaired. It is reachable because the used and total figures are separate reads
+        # and can disagree on presence, the same partial-hardware shape that slips past a
+        # check written for missing hardware. _n() also drops the trailing ".0" that the
+        # NVIDIA parser leaves on both numbers.
+        vram = (f"{_n(s.get('vram_used'))}/{_n(s.get('vram_total'))}"
+                if s.get("vram_total") else "-")
+        parts.append(f"{s['vendor']} util {_n(s.get('util'))}% vram {vram} "
+                     f"{s.get('temp_main') or '-'}C {_n(s.get('power'))}W")
+    parts.append(f"CPU {_n(cpu.get('util'))}% {cpu.get('temp') or '-'}C "
                  f"{('%.0fW' % cpu['power']) if cpu.get('power') is not None else '-'}")
     parts.append(f"RAM {mem['free']}/{mem['total']}")
     parts.append(f"PWR {total_w:.0f}W")
     multi = len(llamas or []) > 1
+    any_alive = any(d.get("alive") for d in (llamas or []))
     for d in (llamas or []):
         if not d.get("alive"):
+            if any_alive:
+                continue
+            # The only server, and it is not answering. Skipping a dead server is right
+            # while another one is alive: a log should not fill with a server that is
+            # simply down. It was also what happened when the fleet held a single entry,
+            # which became reachable the moment the port argument started to focus, and
+            # then the line said nothing about llama at all, which cannot be told apart
+            # from the tool having ignored the argument. The other two surfaces were
+            # already honest here: --probe prints "alive=False phase=off" and the panel
+            # prints "status off ... stale" with "prefill, (server did not answer)".
+            # The reason is _why's own, not a sixth wording of the same fact.
+            parts.append(f"llama :{d.get('port')} {d.get('phase') or 'off'} "
+                         f"({_why(d, 'tg')})")
             continue
         sp = f" spec {d['spec'] * 100:.0f}%" if d.get("spec") is not None else ""
         tag = f":{d['port']} " if multi else ""
-        # a LOG line has no room for a column that says "this one is from the request
-        # that just ended" — so it says it inline. Writing the last rate bare is the same
+        # a log line has no room for a column that says "this one is from the request
+        # that just ended", so it says it inline. Writing the last rate bare is the same
         # defect the panel was carrying: a past number wearing the present tense.
         def _sp(live, last, dec):
             if live is not None:
@@ -2730,7 +3218,7 @@ def _text_line(gpus_data, cpu, mem, llamas, cfgs=None, procs=None):
 def _maybe_enable_rapl():
     """CPU wattage comes from the RAPL energy counter, which most kernels expose only to
     root (the Platypus side-channel mitigation). If it is unreadable and we are on a
-    terminal, offer to open it for this session with one sudo call — the same thing the
+    terminal, offer to open it for this session with one sudo call, the same thing the
     old build did. The README's udev rule makes it permanent instead."""
     if not RAPL_CPU or read_int(f"{RAPL_CPU}/energy_uj", -1) >= 0:
         return
