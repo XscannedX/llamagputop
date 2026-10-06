@@ -734,5 +734,165 @@ class TestGpuPvProcDetection(Base):
         self.assertIn("CPU only (no VRAM)", line)
 
 
+class TestTaskProgressAndStats(Base):
+    """Task progress bar and last task stats in _llama_rows."""
+
+    def test_active_prefill_task_renders_bar_and_eta(self):
+        d = {
+            "alive": True,
+            "phase": "prefill",
+            "pp": 700.0,
+            "tg": None,
+            "ctx": 131072,
+            "active": 1,
+            "queued": 0,
+            "task": {
+                "id": 42,
+                "phase": "prefill",
+                "prompt_total": 1000,
+                "prompt_cache": 500,
+                "prompt_proc": 250,
+                "decoded": 0,
+                "budget": 0,
+                "pct": 0.75,
+                "eta": 0.357,
+            },
+            "task_last": None,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("task #42", text)
+        self.assertIn("75.0%", text)
+        self.assertIn("prefill 750/1000 tok", text)
+        self.assertIn("500 cached", text)
+        self.assertIn("ETA 0.4s", text)
+
+    def test_active_generating_task_renders_bar_and_eta(self):
+        d = {
+            "alive": True,
+            "phase": "generating",
+            "pp": None,
+            "tg": 25.0,
+            "ctx": 131072,
+            "active": 1,
+            "queued": 0,
+            "task": {
+                "id": 43,
+                "phase": "generating",
+                "prompt_total": 1000,
+                "prompt_cache": 1000,
+                "prompt_proc": 0,
+                "decoded": 100,
+                "budget": 500,
+                "pct": 0.20,
+                "eta": 16.0,
+            },
+            "task_last": None,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("task #43", text)
+        self.assertIn("20.0%", text)
+        self.assertIn("gen 100/500 tok", text)
+        self.assertIn("ETA 16.0s", text)
+
+    def test_idle_renders_last_task_stats(self):
+        d = {
+            "alive": True,
+            "phase": "idle",
+            "pp": None,
+            "tg": None,
+            "ctx": 131072,
+            "active": 0,
+            "queued": 0,
+            "task": None,
+            "task_last": {
+                "id": 42,
+                "prompt_total": 10000,
+                "prompt_cache": 8000,
+                "decoded": 250,
+                "elapsed": 12.5,
+                "pp": 650.0,
+                "tg": 28.5,
+            },
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("last task #42", text)
+        self.assertIn("250 gen tok", text)
+        self.assertIn("from 10000 prompt (8000 cached)", text)
+        self.assertIn("in 12.5s (pp 650 t/s, gen 28.5 t/s)", text)
+
+
+class TestSessionTokens(Base):
+    """Session token counter and formatting."""
+
+    def test_fmt_tokens(self):
+        self.assertEqual(lgt._fmt_tokens(0), "0")
+        self.assertEqual(lgt._fmt_tokens(42), "42")
+        self.assertEqual(lgt._fmt_tokens(1420), "1,420")
+        self.assertEqual(lgt._fmt_tokens(9999), "9,999")
+        self.assertEqual(lgt._fmt_tokens(10500), "10.5k")
+        self.assertEqual(lgt._fmt_tokens(165162), "165.2k")
+        self.assertEqual(lgt._fmt_tokens(1250000), "1.25M")
+        self.assertEqual(lgt._fmt_tokens(None), "—")
+
+    def test_llama_rows_shows_session_tokens(self):
+        d = {
+            "alive": True,
+            "phase": "idle",
+            "pp": None,
+            "tg": None,
+            "pp_last": 600.0,
+            "tg_last": 15.2,
+            "ctx": 131072,
+            "active": 0,
+            "queued": 0,
+            "tokens_session": 1420,
+            "tokens_total": 165162,
+            "pp_life": 580.0,
+            "tg_life": 15.0,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("session 1,420 gen tok (165.2k total)", text)
+        self.assertIn("avg 580/15.0 t/s", text)
+
+    def test_llama_rows_shows_zero_session_tokens(self):
+        d = {
+            "alive": True,
+            "phase": "idle",
+            "pp": None,
+            "tg": None,
+            "ctx": 131072,
+            "active": 0,
+            "queued": 0,
+            "tokens_session": 0,
+            "tokens_total": 165162,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("session 0 gen tok (165.2k total)", text)
+
+    def test_power_rows_shows_session_tokens(self):
+        gpus = [{"vendor": "NVIDIA", "power": 45, "power_cap": 60}]
+        cpu = {"power": 25, "rapl_present": True}
+        llamas = [{"alive": True, "tokens_session": 2500}]
+        lgt._session["start"] = 1000.0
+        lgt._session["energy_j"] = 360000.0
+        rows = lgt._power_rows(gpus, cpu, llamas, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("tokens 2,500 gen", text)
+        self.assertIn("7 tok/kJ", text)
+
+    def test_text_line_shows_session_tokens(self):
+        gpus = [{"vendor": "NVIDIA", "util": 10, "vram_used": 2000, "vram_total": 12000, "temp_main": 50, "power": 30}]
+        cpu = {"util": 5, "temp": 45, "power": 15}
+        mem = {"free": 4000, "total": 8000}
+        llamas = [{"alive": True, "port": "8080", "phase": "idle", "pp": None, "pp_last": 600, "tg": None, "tg_last": 15.2, "tokens_session": 350}]
+        line = lgt._text_line(gpus, cpu, mem, llamas)
+        self.assertIn("tok 350", line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
