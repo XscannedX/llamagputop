@@ -693,5 +693,46 @@ class SeriesRetirement(Base):
         self.assertIn("kv_series@%s" % self.LIVE, lgt.HIST)
 
 
+
+
+class TestGpuPvProcDetection(Base):
+    """WSL2 / GPU-PV processes should be recognized as GPU-accelerated rather than CPU-only."""
+
+    def test_dxg_process_is_reported_as_gpu_pv(self):
+        p = {
+            "pid": "1234",
+            "name": "llama-server",
+            "model": "test-model",
+            "rss": 4096,
+            "read": False,
+            "caps": [],
+            "error": None,
+            "gpu_accel": True,
+            "dxg": True,
+            "vram_src": None,
+        }
+        rows = lgt._llama_proc_rows([p], 80)
+        line = "".join(seg[0] for seg in rows[0])
+        self.assertIn("GPU-PV/WSL2", line)
+        self.assertNotIn("CPU only", line)
+
+    def test_cpu_only_process_reports_cpu_only(self):
+        p = {
+            "pid": "5678",
+            "name": "llama-server",
+            "model": "test-model",
+            "rss": 4096,
+            "read": False,
+            "caps": [],
+            "error": None,
+            "gpu_accel": False,
+            "dxg": False,
+            "vram_src": None,
+        }
+        rows = lgt._llama_proc_rows([p], 80)
+        line = "".join(seg[0] for seg in rows[0])
+        self.assertIn("CPU only (no VRAM)", line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

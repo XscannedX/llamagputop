@@ -817,6 +817,8 @@ class _NvidiaFeed(threading.Thread):
                     try:
                         _NV_PROC_MEM[c[0]] = (int(float(c[1])), now)
                     except ValueError:
+                        if "N/A" in c[1]:
+                            _NV_PROC_MEM[c[0]] = (None, now)
                         continue
                 # drop entries for processes that have exited, or the dict grows for the
                 # whole run. The panel already ignores them by age; this only bounds memory
@@ -892,6 +894,31 @@ def discover_gpus():
         if g is not None:
             g.pci_addr = pci_addr
             gpus.append(g)
+    # Fall back to nvidia-smi if DRM reported no NVIDIA cards (e.g. WSL2, Hyper-V GPU-PV)
+    if nvidia_seen == 0 and which("nvidia-smi"):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,name,pci.bus_id", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3).stdout
+            for s_line in out.strip().splitlines():
+                parts = [p.strip() for p in s_line.split(",")]
+                if len(parts) >= 2:
+                    try:
+                        idx = int(parts[0])
+                    except ValueError:
+                        continue
+                    name = parts[1]
+                    pci_addr = parts[2] if len(parts) > 2 else ""
+                    if nvidia_feed is None:
+                        nvidia_feed = _NvidiaFeed()
+                        feeds["nvidia"] = nvidia_feed
+                    g = NvidiaGpu(name, idx, nvidia_feed)
+                    g.pci_addr = pci_addr
+                    gpus.append(g)
+                    nvidia_seen += 1
+        except Exception:
+            pass
+
     # label each card with the Vulkan device index llama.cpp would assign it
     vk = vulkan_device_map()
     for g in gpus:
@@ -1415,7 +1442,10 @@ def _nv_proc_fill(v):
         return v
     mem = _NV_PROC_MEM.get(v["pid"])
     if mem and time.monotonic() - mem[1] < 6:
-        v["vram"], v["gtt"], v["read"], v["vram_src"] = mem[0], None, True, "nvidia-smi"
+        if mem[0] is not None:
+            v["vram"], v["gtt"], v["read"], v["vram_src"] = mem[0], None, True, "nvidia-smi"
+        else:
+            v["vram_src"] = "nvidia-smi-na" 
     return v
 
 
@@ -1448,13 +1478,17 @@ def llama_processes():
             for fd in fds:
                 try:
                     target = os.readlink(f"{p}/fd/{fd}")
-                    if "nvidia" in target or "renderD" in target:
+                    if any(k in target for k in ("nvidia", "renderD", "dxg", "wsl/drivers")):
                         v["gpu_accel"] = True
+                        if "dxg" in target or "wsl/drivers" in target:
+                            v["dxg"] = True
                         break
                 except OSError:
                     pass
         except OSError:
             pass
+        if v["pid"] in _NV_PROC_MEM:
+            v["gpu_accel"] = True
         try:
             files = os.listdir(f"{p}/fdinfo")
         except OSError:
@@ -2460,7 +2494,13 @@ def _llama_proc_rows(procs, width):
                 else:
                     why = "permission denied"
             else:
-                why = "not reported by driver (NVIDIA?)" if p.get("gpu_accel") else "CPU only (no VRAM)"
+                if p.get("gpu_accel"):
+                    if p.get("dxg") or p.get("vram_src") == "nvidia-smi-na":
+                        why = "not reported by driver (GPU-PV/WSL2)"
+                    else:
+                        why = "not reported by driver (NVIDIA?)"
+                else:
+                    why = "CPU only (no VRAM)" 
             seg += [("   VRAM ", DIM), ("—", DIM), (f"  ({why})", DIM)]
         else:
             seg += [("   VRAM ", DIM), (f"{p['vram']}M", 0)]
