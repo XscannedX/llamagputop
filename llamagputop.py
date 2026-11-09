@@ -380,6 +380,22 @@ _PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids",
                   "/usr/share/pci.ids")
 _VENDOR = {"0x1002": "AMD", "0x8086": "Intel", "0x10de": "NVIDIA"}
 
+# Fallback table for devices not yet present in host pci.ids (e.g. Blackwell GB20x)
+_PCI_ID_FALLBACKS = {
+    "10de": {
+        "2f02": "GB202 [GeForce RTX 5090]",
+        "2f03": "GB203 [GeForce RTX 5080]",
+        "2f04": "GB205 [GeForce RTX 5070]",
+        "2f05": "GB205 [GeForce RTX 5070 Ti]",
+        "2f08": "GB206 [GeForce RTX 5060 Ti]",
+        "2f42": "GB202M [GeForce RTX 5090 Max-Q / Mobile]",
+        "2f43": "GB203M [GeForce RTX 5080 Mobile]",
+        "2f44": "GB205M [GeForce RTX 5070 Mobile]",
+        "2f45": "GB206M [GeForce RTX 5060 Mobile]",
+        "2f58": "GB207M [GeForce RTX 5050 Mobile]",
+    }
+}
+
 
 # The device names of pci.ids, {vendor: {device: name}}, read ONCE (round 7c, Fabrizio: «3d
 # ok»). Discovery used to run `lspci -mm -s <addr>` once per card, four programs at every
@@ -427,7 +443,7 @@ def _name_from_pci_ids(vendor_id, device_id):
     """The device's name in pci.ids, None when the database or the entry is missing."""
     vid = vendor_id.replace("0x", "").lower()
     did = device_id.replace("0x", "").lower()
-    return _pci_ids_db().get(vid, {}).get(did)
+    return _pci_ids_db().get(vid, {}).get(did) or _PCI_ID_FALLBACKS.get(vid, {}).get(did)
 
 
 def gpu_product_name(dev_path, vendor_id):
@@ -2768,6 +2784,9 @@ class NvidiaGpu:
             idx = self.index
         f = self.feed.by_index.get(idx)
         if f and time.monotonic() - f.get("ts", 0) < 6:
+            if self.name in ("NVIDIA GPU", "Unknown GPU") and f.get("name"):
+                self.name = f["name"]
+                d["name"] = self.name
             d.update({k: f.get(k) for k in
                       ("util", "mem_util", "vram_used", "vram_total", "temp_main",
                        "power", "power_cap", "sclk", "mclk")})
@@ -2792,6 +2811,9 @@ class NvidiaGpu:
         bus = getattr(self, "pci_addr", None)
         detail = self.feed.detail_by_bus.get(bus) if bus else None
         if detail and time.monotonic() - self.feed.detail_ts <= _SANE_TTL:
+            if self.name in ("NVIDIA GPU", "Unknown GPU") and detail.get("product"):
+                self.name = detail["product"]
+                d["name"] = self.name
             for k, v in detail.items():
                 d.setdefault(k, v)
             drv = self.feed.driver

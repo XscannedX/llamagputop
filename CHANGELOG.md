@@ -31,6 +31,7 @@ belonging to either, so its date is the repository's first day rather than a rel
 
 ### Fixed
 
+* Missing Blackwell GPU names (e.g. RTX 5070 / GB205) resolved via static PCIe ID fallback table and dynamic nvidia-smi feed promotion when host pci.ids lacks newer entries.
 * Aggregate KV cache double-counting on recent llama.cpp builds. Newer builds include generated tokens in `n_prompt_tokens`; the previous formula summed them again, inflating reported KV fill up to +63%. The calculation is now build-agnostic: `occupied += max(_npt, _npc + _sd)`.
 * Handled `nvidia-smi` per-process memory queries returning `"N/A"` in virtualized environments (GPU-PV/WSL2) without raising exceptions.
 * Spurious clock throttle reasons: sub-second power-policy event reasons at idle are no longer classified as active throttling.

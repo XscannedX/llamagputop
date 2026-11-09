@@ -892,5 +892,48 @@ class TestSessionTokens(Base):
         self.assertIn("tok 350", line)
 
 
+class TestNvidiaGpuNaming(Base):
+    def test_nvidia_gpu_name_fallback_from_core_feed(self):
+        class FakeFeed:
+            tool_ok = True
+            by_index = {0: {"name": "NVIDIA GeForce RTX 5070", "ts": time.monotonic()}}
+            detail_by_bus = {}
+            detail_ts = 0.0
+            driver = {}
+        feed = FakeFeed()
+        gpu = lgt.NvidiaGpu("NVIDIA GPU", 0, feed)
+        data = gpu.sample()
+        self.assertEqual(data["name"], "NVIDIA GeForce RTX 5070")
+        self.assertEqual(gpu.name, "NVIDIA GeForce RTX 5070")
+
+    def test_nvidia_gpu_name_fallback_from_detail_feed(self):
+        class FakeFeed:
+            tool_ok = True
+            by_index = {}
+            detail_by_bus = {"0000:14:00.0": {"product": "NVIDIA GeForce RTX 5070"}}
+            detail_ts = time.monotonic()
+            driver = {}
+        feed = FakeFeed()
+        gpu = lgt.NvidiaGpu("NVIDIA GPU", 0, feed)
+        gpu.pci_addr = "0000:14:00.0"
+        data = gpu.sample()
+        self.assertEqual(data["name"], "NVIDIA GeForce RTX 5070")
+        self.assertEqual(gpu.name, "NVIDIA GeForce RTX 5070")
+
+    def test_name_from_pci_ids_blackwell_fallback(self):
+        # Even if pci_ids db does not have 2f04, fallback provides GeForce RTX 5070
+        old_cache = lgt._pci_ids_cache.get("db")
+        try:
+            lgt._pci_ids_cache["db"] = {"10de": {}}  # mock empty nvidia db
+            name = lgt._name_from_pci_ids("10de", "2f04")
+            self.assertIsNotNone(name)
+            self.assertIn("RTX 5070", name)
+        finally:
+            if old_cache is not None:
+                lgt._pci_ids_cache["db"] = old_cache
+            else:
+                lgt._pci_ids_cache.pop("db", None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
