@@ -11,6 +11,30 @@ Dates are the day the work was done, read from the commit history rather than ch
 one soft edge is 1.0.0.0, where a compatibility commit sits between it and 1.0.1.0 without
 belonging to either, so its date is the repository's first day rather than a release event.
 
+## Version 1.0.8.0 (2026-11-09)
+
+### Added
+
+* Extended hardware telemetry and monitoring:
+  - PCIe link negotiation on every GPU panel: reports current link width and speed alongside card and slot maximum capabilities, highlighting degraded width or throughput limits.
+  - NVIDIA detailed telemetry parsed from a persistent `nvidia-smi -q -x` process: P-states, PCIe throughput, AER and PCIe replay counters, video engine utilization, BAR1 usage, and active clock slowdown reasons.
+  - Pre-Zen AMD CPU temperature support (`k10temp` relative Tctl scale) with threshold coloring from the driver's own limits.
+  - A generic `sensors` panel displaying all auxiliary hardware monitoring chips and sensors exposed under sysfs (`hwmon`).
+  - Interactive details menu (toggled via `m`) to configure detail group visibility with All and Minimal presets.
+  - Extended AMD legacy powerplay support (e.g. FirePro W9170 / Hawaii SMU7): static attribute caching, DPM table states, memory pools, and an SMC freeze-guard inhibiting hazardous sysfs reads while DRM compute clients hold the card.
+
+* Inference and server telemetry (`llama.cpp`):
+  - Multi-slot monitoring: when `llama-server` runs with multiple slots (`-np N` with N > 1), renders individual per-slot rows under the server's KV bar showing slot ID, phase (`generating`, `prefill`, `idle`), per-slot context fill bar, generation token budget, and per-slot token rate. Single-slot servers (N = 1) retain byte-identical UI rendering.
+  - Per-slot telemetry dump included in `--probe` mode.
+  - WSL2 and Hyper-V GPU-PV paravirtualization detection: inspects `/proc/<pid>/fd` for `dxg` and `wsl/drivers` descriptors to identify GPU-accelerated processes when DRM nodes are absent, falling back gracefully to `nvidia-smi`. (Closes #2)
+  - Session token tracking and task progress: measures total tokens generated across the session (`tokens_session` derived from `llamacpp:tokens_predicted_total`), task ETA progress bar with prompt token reuse, and overall system energy efficiency (`tok/kJ`). (Closes #4, addresses #3)
+
+### Fixed
+
+* Aggregate KV cache double-counting on recent llama.cpp builds. Newer builds include generated tokens in `n_prompt_tokens`; the previous formula summed them again, inflating reported KV fill up to +63%. The calculation is now build-agnostic: `occupied += max(_npt, _npc + _sd)`.
+* Handled `nvidia-smi` per-process memory queries returning `"N/A"` in virtualized environments (GPU-PV/WSL2) without raising exceptions.
+* Spurious clock throttle reasons: sub-second power-policy event reasons at idle are no longer classified as active throttling.
+
 ## Version 1.0.7.0 (2026-08-28)
 
 ### Added

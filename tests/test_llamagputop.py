@@ -693,8 +693,6 @@ class SeriesRetirement(Base):
         self.assertIn("kv_series@%s" % self.LIVE, lgt.HIST)
 
 
-
-
 class TestGpuPvProcDetection(Base):
     """WSL2 / GPU-PV processes should be recognized as GPU-accelerated rather than CPU-only."""
 
@@ -734,14 +732,14 @@ class TestGpuPvProcDetection(Base):
         self.assertIn("CPU only (no VRAM)", line)
 
 
-class TestTaskProgressAndStats(Base):
-    """Task progress bar and last task stats in _llama_rows."""
+class TestTaskProgress(Base):
+    """Task progress and last task summary in the llama panel."""
 
-    def test_active_prefill_task_renders_bar_and_eta(self):
+    def test_active_prefilling_task_renders_bar_and_eta(self):
         d = {
             "alive": True,
             "phase": "prefill",
-            "pp": 700.0,
+            "pp": 1250.0,
             "tg": None,
             "ctx": 131072,
             "active": 1,
@@ -755,7 +753,7 @@ class TestTaskProgressAndStats(Base):
                 "decoded": 0,
                 "budget": 0,
                 "pct": 0.75,
-                "eta": 0.357,
+                "eta": 0.4,
             },
             "task_last": None,
         }
